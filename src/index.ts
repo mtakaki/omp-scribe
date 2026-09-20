@@ -36,7 +36,7 @@ Cost control is active for this plan turn. Do NOT compose the Markdown plan docu
 1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/criticalFiles/verification/assumptions, plus an \`approach\` array holding one Tokenized Architectural Diff (TAD) line per ordered change step:
    ${TAD_LINE_SHAPE}
    - \`@path\` — project-relative file the step edits.
-   - \`[start-end]\` — inclusive 1-based line range to touch; omit it entirely for a file that does not exist yet.
+   - \`[start-end]\` — inclusive 1-based line range to touch; a single line may be written as \`[N]\`; omit it entirely for a file that does not exist yet.
    - \`{+}\` new file or added section, \`{!}\` deletion, \`{~}\` modification.
    - \`deps(...)\` — project-relative files whose contract this step depends on; may be empty.
    - \`#intent\` — snake_case label naming the step.

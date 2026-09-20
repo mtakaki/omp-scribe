@@ -10,8 +10,8 @@ import { resolve, sep } from "node:path";
  *     @path/to/file.ext[start-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent
  *
  *   `@path`       project-relative target of the edit
- *   `[start-end]` inclusive 1-based line range; omitted for a file that does not
- *                 exist yet (a `{+}` step)
+ *   `[start-end]` inclusive 1-based line range; a single line may be written as
+ *                 `[N]`; omitted for a file that does not exist yet (a `{+}` step)
  *   `{+}` `{!}` `{~}` add / delete / modify
  *   `deps(a,b)`   project-relative files whose contract this step depends on; may
  *                 be omitted or empty
@@ -51,11 +51,11 @@ export interface TadStep {
  *  `propose_plan_blueprint` Zod schema so a line that validates at the tool
  *  boundary always parses. Anchored without flags, so `test`/`exec` are state-free. */
 export const TAD_LINE_RE =
-  /^@(?<path>[A-Za-z0-9_./-]+)(?:\[(?<start>[0-9]+)-(?<end>[0-9]+)\])?\{(?<op>[+!~])\}(?:deps\((?<deps>[^)]*)\))?#(?<intent>[A-Za-z0-9_]+)$/;
+  /^@(?<path>[A-Za-z0-9_./-]+)(?:\[(?<start>[0-9]+)(?:-(?<end>[0-9]+))?\])?\{(?<op>[+!~])\}(?:deps\((?<deps>[^)]*)\))?#(?<intent>[A-Za-z0-9_]+)$/;
 
 /** Human-readable restatement of {@link TAD_LINE_RE}: the exact wire shape the
  *  brain model must emit and the text of every validation error. */
-export const TAD_LINE_SHAPE = "@path/to/file.ext[start-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent";
+export const TAD_LINE_SHAPE = "@path/to/file.ext[start[-end]]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent";
 
 /** Parses one TAD line into its parts, throwing a descriptive error when `line`
  *  does not match {@link TAD_LINE_RE} or carries an inverted line range. */
@@ -67,7 +67,7 @@ export function parseTadLine(line: string): TadStep {
   const { path, start, end, op, deps, intent } = match.groups;
 
   const lineRange: TadLineRange | undefined =
-    start === undefined || end === undefined ? undefined : { start: Number(start), end: Number(end) };
+    start === undefined ? undefined : { start: Number(start), end: end === undefined ? Number(start) : Number(end) };
   if (lineRange && lineRange.end < lineRange.start) {
     throw new Error(
       `Malformed TAD line ${JSON.stringify(line)} — line range end (${lineRange.end}) precedes start (${lineRange.start}).`,

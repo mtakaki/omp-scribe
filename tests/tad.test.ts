@@ -44,6 +44,11 @@ describe("parseTadLine", () => {
     expect(step.dependencies).toEqual([]);
   });
 
+  it("parses a single-line [N] range as start === end", () => {
+    const step = parseTadLine("@backend/prisma/copy-prod-to-staging.ts[189]{~}deps()#extend_main_signature_with_source_dest_origin_params");
+    expect(step.lineRange).toEqual({ start: 189, end: 189 });
+  });
+
   it("rejects lines the tool schema refuses, and inverted ranges with a reason", () => {
     // The Zod schema applies TAD_LINE_RE, so a line it rejects must never reach
     // parseTadLine; a line it accepts — including an inverted range — must parse
@@ -62,6 +67,13 @@ describe("hydrateTadStep", () => {
     await withProject({ "src/a.ts": "line1\nline2\nline3\nline4\nline5\n" }, async root => {
       const hydrated = await hydrateTadStep(root, parseTadLine("@src/a.ts[2-3]{~}deps()#edit"));
       expect(hydrated.snippet).toBe("    2| line2\n    3| line3");
+    });
+  });
+
+  it("hydrates a single-line [N] range to that one line only", async () => {
+    await withProject({ "src/a.ts": "line1\nline2\nline3\nline4\nline5\n" }, async root => {
+      const hydrated = await hydrateTadStep(root, parseTadLine("@src/a.ts[3]{~}deps()#edit"));
+      expect(hydrated.snippet).toBe("    3| line3");
     });
   });
 

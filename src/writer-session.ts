@@ -10,9 +10,9 @@ The brief is labelled plain text:
 TITLE - the plan title, to become the "# " heading.
 CONTEXT - the ask and intended end state.
 APPROACH STEPS - numbered steps. Each step prints its raw TAD (Tokenized Architectural Diff) line and a snippet of the file it targets:
-    @path/to/file.ext[start-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent
+    @path/to/file.ext[start[-end]]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent
       @path         project-relative file the step edits
-      [start-end]   inclusive 1-based line range the step touches; absent when the file does not exist yet
+      [start-end]   inclusive 1-based line range the step touches; a single line may be written as [N]; absent when the file does not exist yet
       {+} add   {!} delete   {~} modify
       deps(...)     files whose contract this step depends on; may be empty
       #intent       the step's snake_case label
