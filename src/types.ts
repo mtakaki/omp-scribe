@@ -12,7 +12,7 @@ export interface PlanBlueprint {
   title: string;
   context: string;
   /** Ordered load-bearing steps, each a Tokenized Architectural Diff (TAD) line —
-   *  `@path/to/file.ext[start-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent`
+   *  `@path/to/file.ext:start[-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent`
    *  (see `src/tad.ts`). The line range is omitted for a file that does not exist
    *  yet. The extension hydrates each referenced range from disk before delegating the
    *  Markdown expansion, so the brain model never restates file content. */

@@ -36,11 +36,12 @@ Cost control is active for this plan turn. Do NOT compose the Markdown plan docu
 1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/criticalFiles/verification/assumptions, plus an \`approach\` array holding one Tokenized Architectural Diff (TAD) line per ordered change step:
    ${TAD_LINE_SHAPE}
    - \`@path\` — project-relative file the step edits.
-   - \`[start-end]\` — inclusive 1-based line range to touch; a single line may be written as \`[N]\`; omit it entirely for a file that does not exist yet.
+   - \`:start-end\` — inclusive 1-based line range to touch; a single line may be written as \`:N\`; omit it entirely for a file that does not exist yet.
    - \`{+}\` new file or added section, \`{!}\` deletion, \`{~}\` modification.
    - \`deps(...)\` — project-relative files whose contract this step depends on; may be empty.
    - \`#intent\` — snake_case label naming the step.
    Never paste file content or line bodies into a step: the extension reads the referenced lines from disk for the writer model.
+   Examples: \`@src/tad.ts:40-92{~}deps(src/types.ts)#widen_path_class\` and \`@frontend/app/obras/[slug]/page.tsx{+}#add_dynamic_route\`.
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
 3. Then continue the normal \`xd://propose\` submission with that slug, as usual.
 Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.

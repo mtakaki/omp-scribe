@@ -11,7 +11,7 @@ const BLUEPRINT: PlanBlueprint = {
   slug: "test-plan",
   title: "Test Plan",
   context: "A short context sentence.",
-  approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+  approach: ["@src/example.ts:1-2{~}deps()#example_intent"],
   criticalFiles: [],
   verification: ["bun test passes"],
   assumptions: [],
