@@ -68,23 +68,34 @@ export interface FakeSdkHandle {
   fakeSdk: FakeSdk;
   /** Replace the event script emitted by the next session. */
   setScript(events: FakeSessionEvent[]): void;
+  /** Queue per-session scripts consumed in order, one per `createAgentSession()`
+   *  call, before falling back to the shared `setScript` script. */
+  queueScripts(...scripts: FakeSessionEvent[][]): void;
   /** The last session created (undefined before first call). */
   lastSession(): FakeAgentSession | undefined;
+  /** Every session created, in creation order. */
+  allSessions(): FakeAgentSession[];
   /** Number of sessions created. */
   sessionCount(): number;
   /** Whether the last session was disposed. */
   lastSessionDisposed(): boolean;
+  /** The options object passed to the last `createAgentSession()` call. */
+  lastOptions(): unknown;
 }
 
 export function createFakeSdk(): FakeSdkHandle {
   let script: FakeSessionEvent[] = [];
+  const scriptQueue: FakeSessionEvent[][] = [];
   const sessions: FakeAgentSession[] = [];
+  const capturedOptions: unknown[] = [];
 
   const fakeSdk: FakeSdk = {
     AgentRegistry: class {},
     SessionManager: { inMemory: (_cwd: string) => ({}) },
-    async createAgentSession(_opts: unknown): Promise<{ session: FakeAgentSession }> {
-      const session = createFakeAgentSession(() => script);
+    async createAgentSession(opts: unknown): Promise<{ session: FakeAgentSession }> {
+      capturedOptions.push(opts);
+      const queued = scriptQueue.length > 0 ? scriptQueue.shift() : undefined;
+      const session = createFakeAgentSession(() => queued ?? script);
       sessions.push(session);
       return { session };
     },
@@ -95,8 +106,14 @@ export function createFakeSdk(): FakeSdkHandle {
     setScript(events: FakeSessionEvent[]) {
       script = events;
     },
+    queueScripts(...scripts: FakeSessionEvent[][]) {
+      scriptQueue.push(...scripts);
+    },
     lastSession() {
       return sessions[sessions.length - 1];
+    },
+    allSessions() {
+      return [...sessions];
     },
     sessionCount() {
       return sessions.length;
@@ -104,6 +121,9 @@ export function createFakeSdk(): FakeSdkHandle {
     lastSessionDisposed() {
       const s = sessions[sessions.length - 1];
       return s?.disposed ?? false;
+    },
+    lastOptions() {
+      return capturedOptions[capturedOptions.length - 1];
     },
   };
 }

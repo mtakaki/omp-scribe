@@ -11,8 +11,8 @@ const BLUEPRINT: PlanBlueprint = {
   slug: "test-plan",
   title: "Test Plan",
   context: "A short context sentence.",
-  approach: ["@src/example.ts:1-2{~}deps()#example_intent"],
-  criticalFiles: [],
+  files: [["E", "src/example.ts", "example file"]],
+  steps: [["E", "~", [1, 2], "Update the example export to describe the change under test.", [], []]],
   verification: ["bun test passes"],
   assumptions: [],
 };
@@ -90,8 +90,8 @@ describe("expandBlueprintToMarkdown", () => {
     expect(result.error).toContain("nonexistent/model");
   });
 
-  it("returns error when writer model returns empty response", async () => {
-    const { fakeSdk, setScript } = createFakeSdk();
+  it("returns error when writer model returns empty response, after retrying once", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
     // Only whitespace delta — should produce empty after trim()
     setScript([
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "   \n  " } },
@@ -109,6 +109,39 @@ describe("expandBlueprintToMarkdown", () => {
     expect("error" in result).toBe(true);
     if (!("error" in result)) throw new Error("unreachable");
     expect(result.error).toContain("empty response");
+    // The empty script applies to every created session, so both the first
+    // attempt and the retry fail; the retry still fired a second session.
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("retries once and returns markdown when the first attempt returns an empty response", async () => {
+    const { fakeSdk, queueScripts, sessionCount, allSessions } = createFakeSdk();
+    queueScripts([{ type: "agent_end", isTerminal: true }], successScript("# Test Plan\n\nRecovered."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+    expect(result.markdown).toBe("# Test Plan\n\nRecovered.");
+    expect(sessionCount()).toBe(2);
+    for (const session of allSessions()) {
+      expect(session.disposed).toBe(true);
+    }
+  });
+
+  it("passes thinkingLevel off to the nested writer session", async () => {
+    const { fakeSdk, setScript, lastOptions } = createFakeSdk();
+    setScript(successScript("# Test Plan\n\nContent here."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    await expandBlueprintToMarkdown(pi, ctx, "@smol", BLUEPRINT);
+    // Fake SDK options are opaque `unknown`; we control the fake and know this shape.
+    const capturedOptions = lastOptions() as { thinkingLevel?: string };
+    expect(capturedOptions.thinkingLevel).toBe("off");
   });
 
   it("returns error when prompt() rejects", async () => {
@@ -190,9 +223,12 @@ describe("expandBlueprintToMarkdown", () => {
       expect(session).toBeDefined();
       const prompt = session!.lastPrompt!;
       expect(prompt).toContain("TITLE\nTest Plan");
-      expect(prompt).toContain(BLUEPRINT.approach[0]!);
-      // Only the step's requested range is hydrated, numbered 1-based from the file.
-      expect(prompt).toContain("snippet of src/example.ts:\n    1| export const a = 1;\n    2| export const b = 2;");
+      expect(prompt).toContain("1. src/example.ts");
+      expect(prompt).toContain("operation: modify");
+      expect(prompt).toContain("lines: 1-2");
+      expect(prompt).toContain("intent: Update the example export to describe the change under test.");
+      // Only the step's requested range is hydrated, numbered 1-based from the file, indented under "source:".
+      expect(prompt).toContain("source:\n          1| export const a = 1;\n          2| export const b = 2;");
       expect(prompt).not.toContain("export const c = 3;");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -302,8 +338,8 @@ describe("expandDocBlueprintToMarkdown", () => {
     expect(result.error).toContain("nonexistent/model");
   });
 
-  it("returns error when writer model returns empty response", async () => {
-    const { fakeSdk, setScript } = createFakeSdk();
+  it("returns error when writer model returns empty response, after retrying once", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
     setScript([
       { type: "agent_end", isTerminal: true },
     ]);
@@ -315,6 +351,39 @@ describe("expandDocBlueprintToMarkdown", () => {
     expect("error" in result).toBe(true);
     if (!("error" in result)) throw new Error("unreachable");
     expect(result.error).toContain("empty response");
+    // The empty script applies to every created session, so both the first
+    // attempt and the retry fail; the retry still fired a second session.
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("retries once and returns markdown when the first attempt returns an empty response", async () => {
+    const { fakeSdk, queueScripts, sessionCount, allSessions } = createFakeSdk();
+    queueScripts([{ type: "agent_end", isTerminal: true }], successScript("# Test README\n\nRecovered."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandDocBlueprintToMarkdown(pi, ctx, "@smol", DOC_BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+    expect(result.markdown).toBe("# Test README\n\nRecovered.");
+    expect(sessionCount()).toBe(2);
+    for (const session of allSessions()) {
+      expect(session.disposed).toBe(true);
+    }
+  });
+
+  it("passes thinkingLevel off to the nested writer session", async () => {
+    const { fakeSdk, setScript, lastOptions } = createFakeSdk();
+    setScript(successScript("# Test README\n\nContent."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    await expandDocBlueprintToMarkdown(pi, ctx, "@smol", DOC_BLUEPRINT);
+    // Fake SDK options are opaque `unknown`; we control the fake and know this shape.
+    const capturedOptions = lastOptions() as { thinkingLevel?: string };
+    expect(capturedOptions.thinkingLevel).toBe("off");
   });
 
   it("sends only title and sections to prompt (omits slug and path)", async () => {
