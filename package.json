@@ -1,0 +1,27 @@
+{
+  "name": "omp-scribe",
+  "version": "1.0.0",
+  "description": "Splits oh-my-pi plan-mode drafting: an expensive model emits a compact JSON blueprint, a cheap model expands it into the Markdown plan file.",
+  "type": "module",
+  "files": [
+    "src"
+  ],
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "bun test",
+    "verify-load": "node scripts/verify-load.mjs",
+    "link:local": "omp plugin link ."
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.1.11",
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.7.0"
+  }
+}
