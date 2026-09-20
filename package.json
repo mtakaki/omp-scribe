@@ -22,7 +22,8 @@
     "test": "bun test",
     "verify-load": "node scripts/verify-load.mjs",
     "link:local": "omp plugin link .",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "publish:local": "npm publish --access public"
   },
   "omp": {
     "extensions": [

@@ -1,6 +1,15 @@
 # omp-scribe
+[![npm version](https://img.shields.io/npm/v/omp-scribe.svg)](https://www.npmjs.com/package/omp-scribe)
 
 Cost-reduction extension for oh-my-pi. It splits expensive-model prose authoring into two phases — a compact blueprint from the expensive model, then Markdown expansion by a cheap model — and substitutes the expanded text into the pending `write` before the native tool executes, so the expensive model never emits the document body. **Plan mode** runs automatically: the plan model calls `propose_plan_blueprint` with compact JSON metadata plus one Tokenized Architectural Diff line per step, then writes the literal placeholder `"pending"` (7 bytes) as the plan file's content. **Doc-blueprint mode** (opted in with `/scribe-doc`) applies the same blueprint-and-expand flow to any standalone Markdown document — README, ARCHITECTURE, CHANGELOG entries, ADRs, PR descriptions.
+
+## Install from npm
+
+```bash
+omp install omp-scribe
+```
+
+Or visit the [npm package page](https://www.npmjs.com/package/omp-scribe).
 
 ## Install & build
 
@@ -22,7 +31,6 @@ npm run build
 # this invocation only — not installed, not listed in /extensions:
 omp --extension /path/to/omp-scribe --plan-yolo -p "Your plan request here"
 # register the package so every session loads it (npm spec, local path, or marketplace ref):
-omp install omp-scribe
 npm run link:local   # omp plugin link . — link this checkout instead
 ```
 
