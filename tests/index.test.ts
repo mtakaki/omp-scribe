@@ -16,6 +16,9 @@ import { readStatsFile } from "../src/stats-store";
 import { createFakeExtensionApi, createFakeExtensionContext, customMessageEntry, makeModel, modeChangeEntry, type FakeExtensionApi } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
+/** Shared example TAD-line literal reused across blueprint fixtures. */
+const EXAMPLE_TAD_LINE = "@src/example.ts:1-2{~}deps()#example_intent";
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Turn-start event. Plan-mode detection reads the session branch (see
@@ -308,7 +311,7 @@ describe("scribe: message_end", () => {
       slug: "acc-test",
       title: "Acc Test",
       context: "Context.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["pass"],
       assumptions: [],
@@ -361,7 +364,7 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "my-plan",
       title: "My Plan",
       context: "Context sentence.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["bun test"],
       assumptions: [],
@@ -394,7 +397,7 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "lean-plan",
       title: "Lean Plan",
       context: "Context.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
     };
     const result = await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "bp-lean", minimal, ctx) as Record<string, unknown>;
 
@@ -416,7 +419,7 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "failing-plan",
       title: "Failing",
       context: "Context.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -446,7 +449,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "swapped-plan",
       title: "Swapped Plan",
       context: "Context.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["pass"],
       assumptions: [],
@@ -479,7 +482,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "dup-plan",
       title: "Dup Plan",
       context: "C.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -561,7 +564,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "plan-alias",
       title: "Plan Alias",
       context: "C.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -589,7 +592,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "right-slug",
       title: "Right",
       context: "C.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -622,7 +625,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "first-slug",
       title: "First",
       context: "C.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -652,7 +655,7 @@ describe("scribe: tool_call write swap", () => {
       slug: "my_slug",
       title: "Under",
       context: "C.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -759,7 +762,7 @@ describe("scribe: local model cost regression", () => {
       slug: "local-model-plan",
       title: "Local Model Plan",
       context: "Context.",
-      approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+      approach: [EXAMPLE_TAD_LINE],
       criticalFiles: [],
       verification: ["v"],
       assumptions: [],
@@ -812,7 +815,7 @@ describe("scribe: local model cost regression", () => {
         slug: "local-model-plan",
         title: "Local Model Plan",
         context: "Context.",
-        approach: ["@src/example.ts[1-2]{~}deps()#example_intent"],
+        approach: [EXAMPLE_TAD_LINE],
         criticalFiles: [],
         verification: ["v"],
         assumptions: [],
@@ -1286,7 +1289,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-plan",
-      { slug: "status-plan", title: "Status Plan", context: "C.", approach: ["@src/example.ts[1-2]{~}deps()#example_intent"] },
+      { slug: "status-plan", title: "Status Plan", context: "C.", approach: [EXAMPLE_TAD_LINE] },
       ctx,
     );
     expect(statuses.get("scribe")).toBe(
@@ -1306,7 +1309,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-fail",
-      { slug: "fail-plan", title: "Fail", context: "C.", approach: ["@src/example.ts[1-2]{~}deps()#example_intent"] },
+      { slug: "fail-plan", title: "Fail", context: "C.", approach: [EXAMPLE_TAD_LINE] },
       ctx,
     );
 

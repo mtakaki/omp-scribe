@@ -7,15 +7,16 @@ import { resolve, sep } from "node:path";
  *
  * One TAD line describes one ordered change step:
  *
- *     @path/to/file.ext[start-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent
+ *     @path/to/file.ext:start[-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent
  *
- *   `@path`       project-relative target of the edit
- *   `[start-end]` inclusive 1-based line range; a single line may be written as
- *                 `[N]`; omitted for a file that does not exist yet (a `{+}` step)
+ *   `@path`        project-relative target of the edit; any character except
+ *                  whitespace and the structural delimiters `: { } #`
+ *   `:start[-end]` inclusive 1-based line range; a single line may be written as
+ *                  `:N`; omitted for a file that does not exist yet (a `{+}` step)
  *   `{+}` `{!}` `{~}` add / delete / modify
- *   `deps(a,b)`   project-relative files whose contract this step depends on; may
- *                 be omitted or empty
- *   `#intent`     snake_case label naming the step
+ *   `deps(a,b)`    project-relative files whose contract this step depends on; may
+ *                  be omitted or empty
+ *   `#intent`      snake_case label naming the step
  *
  * The brain model emits these lines instead of `{summary, detail}` objects: the
  * extension hydrates each referenced line range from disk and hands the raw line
@@ -51,11 +52,11 @@ export interface TadStep {
  *  `propose_plan_blueprint` Zod schema so a line that validates at the tool
  *  boundary always parses. Anchored without flags, so `test`/`exec` are state-free. */
 export const TAD_LINE_RE =
-  /^@(?<path>[A-Za-z0-9_./-]+)(?:\[(?<start>[0-9]+)(?:-(?<end>[0-9]+))?\])?\{(?<op>[+!~])\}(?:deps\((?<deps>[^)]*)\))?#(?<intent>[A-Za-z0-9_]+)$/;
+  /^@(?<path>[^\s:{}#]+)(?::(?<start>[0-9]+)(?:-(?<end>[0-9]+))?)?\{(?<op>[+!~])\}(?:deps\((?<deps>[^)]*)\))?#(?<intent>[A-Za-z0-9_]+)$/;
 
 /** Human-readable restatement of {@link TAD_LINE_RE}: the exact wire shape the
  *  brain model must emit and the text of every validation error. */
-export const TAD_LINE_SHAPE = "@path/to/file.ext[start[-end]]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent";
+export const TAD_LINE_SHAPE = "@path/to/file.ext:start[-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent";
 
 /** Parses one TAD line into its parts, throwing a descriptive error when `line`
  *  does not match {@link TAD_LINE_RE} or carries an inverted line range. */
