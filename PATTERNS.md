@@ -70,6 +70,37 @@ try {
 - Re-assign to `const activeSession = session` to provide a stable reference for the event subscription closure (immutable re-binding)
 - Dispose is unconditional in `finally`, protecting against early returns and exceptions
 
+### Bounded Retry Around a Nested-Session Call
+
+**File: `writer-session.ts`**
+
+`runWriterExpansion` streams exactly one nested-session completion; `runWriterExpansionWithRetry` places a single, bounded retry in front of it:
+
+```typescript
+async function runWriterExpansionWithRetry(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  writerModel: Model,
+  systemPrompt: string,
+  promptText: string,
+): Promise<ExpandResult> {
+  const first = await runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText);
+  if (!("error" in first)) return first;
+  if (ctx.hasUI) {
+    ctx.ui.notify(`Scribe: writer model failed (${first.error}); retrying with a fresh session.`, "warning");
+  }
+  return runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText);
+}
+```
+
+**Pattern:**
+- Same signature as the helper it wraps, so a caller swaps one call for the other with no other change.
+- Both a thrown session error and an empty completion reach the caller as `{ error }` from `runWriterExpansion`, so the single `"error" in first` check covers both transient cases.
+- The retry constructs a brand-new nested session (no reused state), which is what makes it a genuine second attempt rather than a replay.
+- Exactly one retry: a persistently broken writer model still surfaces its error promptly instead of looping.
+- `expandBlueprintToMarkdown` and `expandDocBlueprintToMarkdown` call this wrapper only; `runWriterExpansion` is never invoked directly by either public entry point.
+- The wrapped helper is what streams `message_update`/`text_delta` events into the markdown string and folds each assistant `message_end` into the writer's token-usage and cost totals.
+
 ### Event Handler Async Signatures
 
 **File: `index.ts` (lines 33-42, 103-126, 128-151)**
@@ -109,12 +140,14 @@ pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
 
 ### Discriminated Union Return Type (`Result<T>`)
 
-**File: `writer-session.ts` (line 25)**
+**File: `writer-session.ts`**
 
 Errors are returned as part of the return value, not thrown:
 
 ```typescript
-export type ExpandResult = { markdown: string } | { error: string };
+export type ExpandResult =
+  | { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number }
+  | { error: string };
 
 export async function expandBlueprintToMarkdown(
   pi: ExtensionAPI,
@@ -122,27 +155,31 @@ export async function expandBlueprintToMarkdown(
   writerModelSpec: string,
   blueprint: PlanBlueprint,
 ): Promise<ExpandResult> {
-  const writerModel = ctx.models.resolve(writerModelSpec) ?? ctx.models.resolve("@smol");
+  const writerModel = resolveWriterModel(ctx, writerModelSpec); // spec ?? "@smol"
   if (!writerModel) {
     return { error: `No model resolves for writer model "${writerModelSpec}" or fallback role "@smol".` };
   }
-  
+
+  let resolvedSteps: ScribeStepResolved[];
   try {
-    // ...
-    if (!markdown) return { error: "Writer model returned an empty response." };
-    return { markdown };
+    validateScribeBlueprint(blueprint);
+    resolvedSteps = resolveScribeSteps(blueprint);
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
+
+  const hydrated = await Promise.all(resolvedSteps.map(step => hydrateScribeStep(ctx.cwd, step)));
+  return runWriterExpansionWithRetry(pi, ctx, writerModel, WRITER_SYSTEM_PROMPT, buildPlanPromptText(blueprint, hydrated));
 }
 ```
 
 **Pattern:**
-- Tagged union: caller must handle both branches (`"markdown" in result` or `"error" in result`)
+- Tagged union: caller must handle both branches (`"error" in result` narrows to the failure; otherwise `result.markdown`)
 - No throwing from normal-path errors; exceptions only for truly unexpected failures
-- Catch-all exception handler converts unknown errors to the error discriminant
-- Fallback model resolution (`resolve(A) ?? resolve(B)`) provides graceful degradation
+- Catch-all exception handler converts unknown errors to the error discriminant — including the descriptive `Error` `validateScribeBlueprint` throws
+- Fallback model resolution (`resolveWriterModel()` = spec `??` `@smol`) provides graceful degradation
 - All return paths remain type-safe and exhaustive
+- The success variant is no longer just the text: it carries the writer model's identity, token usage, and cost, which `index.ts` forwards into `PendingBlueprint` so `computeCosts()` (`pricing.ts`) and `appendSavingsRun()` (`stats-store.ts`) can price and persist the run after the write swap
 
 ### Tool Execution Error Response (`isError` flag)
 
@@ -314,7 +351,7 @@ export function sameModel(resolved: Model, current: Model | undefined): boolean 
 
 ### Tool Parameter Types via Zod
 
-**File: `index.ts` (lines 50-74)**
+**File: `index.ts`**
 
 Runtime validation with TypeScript type inference:
 
@@ -324,13 +361,18 @@ parameters: z.object({
     .string()
     .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
     .describe("Plan slug; the final file is local://<slug>-plan.md"),
-  approach: z
-    .array(
-      z.string().regex(TAD_LINE_RE, `Each approach entry must be a Tokenized Architectural Diff line: ${TAD_LINE_SHAPE}`),
-    )
+  title: z.string().describe("Short plan title"),
+  context: z.string().describe("2-4 sentences: literal ask, need, intended end state"),
+  files: z
+    .array(z.array(z.unknown()).min(3).max(3))
     .min(1)
-    .describe(`Ordered load-bearing change steps, one TAD line each: ${TAD_LINE_SHAPE}`),
-  // ...
+    .describe("Files the plan touches, each a 3-element [id, path, reason] array …"),
+  steps: z
+    .array(z.array(z.unknown()).min(6).max(6))
+    .min(1)
+    .describe("Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array …"),
+  verification: z.array(z.string()).optional(),
+  assumptions: z.array(z.string()).optional(),
 }),
 ```
 
@@ -338,18 +380,23 @@ And in the execute function:
 
 ```typescript
 async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-  const blueprint = params as PlanBlueprint;  // Type-safe coercion after Zod validation
+  const raw = params as PlanBlueprintInput;          // Safe coercion after Zod validation
+  const blueprint: PlanBlueprint = {
+    ...raw,
+    verification: raw.verification ?? [],            // Fill the optional fields the model omitted
+    assumptions: raw.assumptions ?? [],
+  };
   // ...
 }
 ```
 
 **Pattern:**
 - Zod validates input at the tool boundary (guarantees schema compliance)
-- `.describe()` provides human-readable field documentation
-- `.min(1)` enforces non-empty arrays
+- `.describe()` provides human-readable field documentation, including the exact tuple arity and field order
+- `.min(1)` enforces non-empty arrays; `.optional()` keeps trailing fields the model may drop on a large call from failing the whole tool call
 - `.regex()` enforces slug format
-- `params as PlanBlueprint` is safe because Zod has already validated shape
-- Type system and validation are unified through the schema
+- `params as PlanBlueprintInput` is safe because Zod has already validated the shape
+- Zod has no tuple/union combinator, so `files`/`steps` can only be asserted as fixed-length arrays of `unknown` — `validateScribeBlueprint` in `scribe-ir.ts` is the sole place doing the per-position semantic checks (id uniqueness, operation membership, range ordering, the fileId cross-reference). This two-layer Zod-shape-plus-hand-written-validator split replaces the old approach, where one anchored regex had to validate every step line end to end.
 
 ### Event Handler Parameter Typing
 
@@ -389,7 +436,9 @@ Public export constants:
 
 ```typescript
 export const BLUEPRINT_TOOL_NAME = "propose_plan_blueprint";
+export const DOC_BLUEPRINT_TOOL_NAME = "propose_doc_blueprint";
 export const PLACEHOLDER_CONTENT = "pending";
+export const DEFAULT_WRITER_MODEL = "@smol";
 ```
 
 Private constants:
@@ -411,7 +460,7 @@ export function pendingPlanEntry(...): { key: string; entry: PendingBlueprint } 
 
 ### Functions: camelCase, Descriptive Verbs
 
-**File: `config.ts` & `writer-session.ts`**
+**File: `config.ts`, `scribe-ir.ts` & `writer-session.ts`**
 
 Exported utility functions:
 
@@ -425,7 +474,12 @@ export function isPlanModeBranch(branch: readonly unknown[]): boolean { /* ... *
 export function isPlanModeActive(ctx: ExtensionContext): boolean { /* ... */ }
 export function planFileTarget(path: unknown): PlanFileTarget | undefined { /* ... */ }
 export function pendingPlanEntry(...): { key: string; entry: PendingBlueprint } | undefined { /* ... */ }
+export function pendingDocEntry(...): { key: string; entry: PendingBlueprint } | undefined { /* ... */ }
 export function sameModel(resolved: Model, current: Model | undefined): boolean { /* ... */ }
+export function resolveWriterModel(ctx: ExtensionContext, spec: string): Model | undefined { /* ... */ }
+export function validateScribeBlueprint(blueprint: PlanBlueprint): void { /* ... */ }          // scribe-ir.ts
+export function resolveScribeSteps(blueprint: PlanBlueprint): ScribeStepResolved[] { /* ... */ } // scribe-ir.ts
+export async function hydrateScribeStep(projectRoot: string, step: ScribeStepResolved): Promise<HydratedScribeStep> { /* ... */ }
 export async function expandBlueprintToMarkdown( /* ... */ ): Promise<ExpandResult> { /* ... */ }
 ```
 
@@ -438,36 +492,42 @@ export async function expandBlueprintToMarkdown( /* ... */ ): Promise<ExpandResu
 
 ### Interfaces & Types: PascalCase
 
-**File: `tad.ts`, `types.ts` & `config.ts`**
+**File: `types.ts`, `scribe-ir.ts` & `config.ts`**
 
 ```typescript
-export interface TadStep { /* ... */ }
-export interface TadLineRange { /* ... */ }
-export type TadOperation = "+" | "!" | "~";
-export interface PlanBlueprintFile { /* ... */ }
+export type ScribeOperation = "+" | "!" | "~";
+export type ScribeFile = readonly [id: string, path: string, reason: string];
+export type ScribeRange = readonly [start: number, end: number];
+export type ScribeStep = readonly [fileId: string, operation: ScribeOperation, range: ScribeRange | null, intent: string, preserve: readonly string[], doNot: readonly string[]];
 export interface PlanBlueprint { /* ... */ }
-export interface ScribeConfig { /* ... */ }
-export type ExpandResult = { markdown: string } | { error: string };
+export interface DocBlueprintSection { /* ... */ }
+export interface DocBlueprint { /* ... */ }
+export interface ScribeStepResolved { /* ... */ }   // scribe-ir.ts
+export interface HydratedScribeStep { /* ... */ }   // scribe-ir.ts
+export interface ScribeConfig { /* ... */ }         // config.ts
+export type ExpandResult = { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number } | { error: string };
 ```
 
 **Pattern:**
 - Interfaces are PascalCase (domain types)
-- Type aliases are PascalCase (union types, discriminated unions)
-- Suffix interfaces with domain noun: `...Blueprint`, `...Config`, `...Step`
+- Type aliases are PascalCase, covering both the positional Scribe IR tuples and discriminated unions
+- Suffix interfaces with the domain noun: `...Blueprint`, `...Config`, `...Step`, `...Range`
 
 ### Variables: camelCase, Descriptive Nouns
 
 **File: `index.ts`**
 
 ```typescript
-let cfg: ScribeConfig = { /* ... */ };  // Configuration
-const pendingMarkdown = new Map<string, string>();  // Cache
+let cfg: ScribeConfig = { /* ... */ };               // Configuration
+let lastKnownModels: Model[] = [];                   // Model snapshot for /scribe-model
+let brainUsage = { input: 0, output: 0 };            // Cost-tracking state for this turn
+let brainOutputRatePerMillionUsd = 0;
 const sessionKey = (ctx: ExtensionContext): string => { /* ... */ };  // Derived key function
 ```
 
 **Pattern:**
 - Local variables use full nouns (`cfg`, `blueprint`, `markdown`, `result`)
-- Map keys are meaningful (session ID + slug)
+- Store keys are the draft's own slug (plan) or declared write target (doc); session ownership lives inside the entry, not in the key
 - Derived functions get descriptive names (`sessionKey`)
 
 ### Private vs. Export
@@ -580,25 +640,36 @@ export async function readScribeConfig(pi: ExtensionAPI, cwd: string): Promise<S
 
 ### Extension Factory Function Pattern
 
-**File: `index.ts` (line 23)**
+**File: `index.ts`**
 
 ```typescript
 export default function scribe(pi: ExtensionAPI): void {
   // 1. Register flags first
   registerScribeFlags(pi);
-  
+
   // 2. Initialize module-scoped state
   let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL };
-  const pendingMarkdown = new Map<string, string>();
-  
+  let lastKnownModels: Model[] = [];
+  let brainUsage = { input: 0, output: 0 };   // cost tracking, reset per plan turn
+  let brainModelId: string | undefined;
+  let brainCostUsd = 0;
+  let brainOutputRatePerMillionUsd = 0;
+
   // 3. Register event handlers in order of lifecycle
-  pi.on("session_start", async () => { /* ... */ });
+  pi.on("session_start", async (_event, ctx) => { /* ... */ });
   pi.on("session_shutdown", async (_event, ctx) => { /* ... */ });
+  pi.on("message_end", async (event, ctx) => { /* brain-model usage/cost accounting */ });
   pi.on("before_agent_start", async (event, ctx) => { /* ... */ });
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => { /* ... */ });
-  
-  // 4. Register the tool itself
-  pi.registerTool({ /* ... */ });
+
+  // 4. Register both tools (inactive until a mode activates them)
+  pi.registerTool({ /* propose_plan_blueprint */ });
+  pi.registerTool({ /* propose_doc_blueprint */ });
+
+  // 5. Register the slash commands
+  pi.registerCommand("savings", { /* ... */ });
+  pi.registerCommand("scribe-doc", { /* ... */ });
+  pi.registerCommand("scribe-model", { /* ... */ });
 }
 ```
 
@@ -606,19 +677,21 @@ export default function scribe(pi: ExtensionAPI): void {
 - Extension factory returns `void` (framework handles registration)
 - All setup happens synchronously in the factory
 - Flags are registered before any event handlers
-- Event handlers close over module state (cfg, pendingMarkdown)
-- Tool registration can happen anywhere; typically last
+- Event handlers close over module state (`cfg`, `lastKnownModels`, the cost-tracking variables)
+- Both tools are registered once and start inactive; per-turn activation happens in `before_agent_start`
+- Command handlers receive an `ExtensionCommandContext`, which is where the `/scribe-model` picker and completions live
 - All binding is declarative (no imperative "on demand" registration)
 
 ### State Isolation: Closure Capture
 
-**File: `index.ts` (lines 26-29)**
+**File: `index.ts`**
 
 ```typescript
 let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL };
-const pendingMarkdown = new Map<string, string>();
+let lastKnownModels: Model[] = [];
+let brainUsage = { input: 0, output: 0 };
 
-const sessionKey = (ctx: ExtensionContext): string => 
+const sessionKey = (ctx: ExtensionContext): string =>
   ctx.sessionManager.getSessionId?.() ?? "default";
 ```
 
@@ -626,85 +699,115 @@ Then in every event handler:
 
 ```typescript
 pi.on("session_start", async (_event, ctx) => {
-  cfg = await readScribeConfig(pi, ctx.cwd);  // Writes to outer cfg
+  cfg = await readScribeConfig(pi, ctx.cwd);      // Writes to outer cfg
+  lastKnownModels = ctx.models.list?.() ?? [];    // Snapshot for /scribe-model
 });
 
 pi.on("session_shutdown", async (_event, ctx) => {
-  const prefix = `${sessionKey(ctx)}:`;
-  for (const key of [...pendingMarkdown.keys()]) {
-    if (key.startsWith(prefix)) pendingMarkdown.delete(key);  // Modifies outer Map
+  const key = sessionKey(ctx);
+  const store = pendingMarkdownStore();           // Process-wide store, not a closure cache
+  for (const [slug, entry] of [...store.entries()]) {
+    if (entry.sessionKey === key) store.delete(slug);
   }
 });
 
-// In the tool execute function (lines 79-99):
+// In the plan blueprint tool's execute function:
 async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
   // Uses cfg from outer scope
   const result = await expandBlueprintToMarkdown(pi, ctx, cfg.writerModel, blueprint);
-  // Writes to pendingMarkdown from outer scope
-  pendingMarkdown.set(`${sessionKey(ctx)}:${blueprint.slug}`, result.markdown);
+  // Writes to the process-wide store from outer scope, keyed by slug
+  pendingMarkdownStore().set(blueprint.slug, {
+    sessionKey: sessionKey(ctx),
+    markdown: result.markdown,
+    writerModel: result.model,
+    writerUsage: result.usage,
+    writerCostUsd: result.costUsd,
+  });
 }
 ```
 
 **Pattern:**
 - Module-level `let` variables are visible to all event handlers (closure)
-- Events can update shared state (cfg, pendingMarkdown)
-- Session ID is derived on demand via `sessionKey()` function
-- Cache is keyed by `${sessionId}:${slug}` to isolate multiple concurrent sessions
+- Events can update shared state (`cfg`, `lastKnownModels`, the cost-tracking quartet)
+- Session ID is derived on demand via `sessionKey()` and then carried *inside* each store entry
+- Drafts live in the process-wide singleton stores rather than a per-factory Map, so duplicate factory invocations share them; sessions are isolated by `entry.sessionKey` at lookup time, not by a composite key
 
 ### Session Lifecycle: Start → Shutdown
 
-**File: `index.ts` (lines 33-42)**
+**File: `index.ts`**
 
 ```typescript
 pi.on("session_start", async (_event, ctx) => {
   cfg = await readScribeConfig(pi, ctx.cwd);
+  lastKnownModels = ctx.models.list?.() ?? [];
+  showStatus(ctx, baseStatus(ctx));
 });
 
 pi.on("session_shutdown", async (_event, ctx) => {
-  const prefix = `${sessionKey(ctx)}:`;
-  for (const key of [...pendingMarkdown.keys()]) {
-    if (key.startsWith(prefix)) pendingMarkdown.delete(key);
+  const key = sessionKey(ctx);
+  for (const [slug, entry] of [...pendingMarkdownStore().entries()]) {
+    if (entry.sessionKey === key) pendingMarkdownStore().delete(slug);
   }
+  for (const [path, entry] of [...pendingDocMarkdownStore().entries()]) {
+    if (entry.sessionKey === key) pendingDocMarkdownStore().delete(path);
+  }
+  for (const [path, owner] of [...docDraftHistory().entries()]) {
+    if (owner === key) docDraftHistory().delete(path);
+  }
+  armedDocSessions().delete(key);
+  for (const [id, swap] of [...consumedWriteSwaps().entries()]) {
+    if (swap.sessionKey === key) consumedWriteSwaps().delete(id);
+  }
+  if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 });
 ```
 
 **Pattern:**
-- `session_start` loads fresh configuration for this session
-- `session_shutdown` cleans up session-specific cached data
-- Cleanup is keyed by session ID to isolate multiple concurrent sessions
-- Copy array before iteration: `[...pendingMarkdown.keys()]` (prevents concurrent modification issues)
+- `session_start` loads fresh configuration, snapshots the model list for `/scribe-model`, and paints the footer
+- `session_shutdown` sweeps all five singleton stores, deleting only the entries this session owns
+- Ownership is the `sessionKey` carried inside each entry (or the `Set`/`Map` key for armed sessions and draft history), which keeps concurrent sessions from evicting each other's drafts
+- Copy before iterating: `[...store.entries()]` (prevents concurrent-modification issues while deleting)
+- The footer status key is cleared on shutdown so a later session starts clean
 
 ### Turn-Scoped Activation (before_agent_start)
 
-**File: `index.ts` (lines 103-126)**
+**File: `index.ts`**
 
 ```typescript
 pi.on("before_agent_start", async (event, ctx) => {
   const wantsBlueprintTool = isPlanModeActive(ctx);
+  if (wantsBlueprintTool) {
+    brainUsage = { input: 0, output: 0 };   // fresh accounting per plan turn
+    brainModelId = undefined;
+    brainCostUsd = 0;
+    brainOutputRatePerMillionUsd = 0;
+  }
+  const wantsDocTool = armedDocSessions().has(sessionKey(ctx));
+
   const activeTools = pi.getActiveTools();
   const hasBlueprintTool = activeTools.includes(BLUEPRINT_TOOL_NAME);
-  
-  if (wantsBlueprintTool !== hasBlueprintTool) {
-    const nextTools = wantsBlueprintTool
-      ? [...activeTools, BLUEPRINT_TOOL_NAME]
-      : activeTools.filter(name => name !== BLUEPRINT_TOOL_NAME);
-    await pi.setActiveTools(nextTools);
+  const hasDocTool = activeTools.includes(DOC_BLUEPRINT_TOOL_NAME);
+
+  if (wantsBlueprintTool !== hasBlueprintTool || wantsDocTool !== hasDocTool) {
+    let nextTools = [...activeTools];
+    // …add each wanted tool / filter out each unwanted one…
+    await pi.setActiveTools(nextTools);     // one call reconciles both tools
   }
-  
-  if (!wantsBlueprintTool) return;
-  
-  // ... advisory logging ...
-  
-  return { systemPrompt: [...event.systemPrompt, SCRIBE_DIRECTIVE] };
+
+  const additions: string[] = [];
+  if (wantsBlueprintTool) additions.push(SCRIBE_DIRECTIVE);
+  if (wantsDocTool) additions.push(DOC_SCRIBE_DIRECTIVE);
+  if (additions.length === 0) return;
+  return { systemPrompt: [...event.systemPrompt, ...additions] };
 });
 ```
 
 **Pattern:**
-- Check whether this is a plan-mode turn using `isPlanModeActive(ctx)` (scans session branch)
-- Activate the tool only on plan-mode turns
-- Inject the directive (`SCRIBE_DIRECTIVE`) that tells the model how to use the tool
-- Return modified `systemPrompt` array; omit return on non-plan turns
-- Advisory warnings logged if config mismatches (e.g., wrong brain model selected)
+- Two independent mode checks drive two independent activations: `isPlanModeActive(ctx)` (scans the session branch) and `armedDocSessions().has(sessionKey(ctx))` (the `/scribe-doc` toggle)
+- Both tools are reconciled in a single `setActiveTools` call, so the active set never settles in an intermediate state
+- Entering plan mode resets the brain cost-tracking state, so each plan turn is priced on its own tokens
+- Only the directives that apply are appended; when neither mode is on, the handler returns nothing
+- A plan-mode transition also announces the resolved writer model, and an advisory warning is logged if the configured brain model differs from the active one
 
 ### Event Handler Return Contracts
 
@@ -772,6 +875,11 @@ pi.on("before_agent_start", async (event, ctx) => {
   // ctx.sessionManager.getSessionId?.() — unique session ID
   // ctx.models.resolve(spec) — resolve model by name/role
   // ctx.models.current() — current active model
+  // ctx.models.list() — authenticated models, for /scribe-model's picker + completions
+  // ctx.hasUI — whether a UI is attached
+  // ctx.ui.notify(msg, level) — user notifications
+  // ctx.ui.setStatus(key, text) — footer status line
+  // ctx.ui.select(title, options, opts) — the /scribe-model picker
   // ctx.cwd — working directory
   // ctx.modelRegistry — model provider registry
   // ctx.localProtocolOptions — for sharing local:// across sessions
@@ -786,10 +894,11 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 
 **Pattern:**
 - `ExtensionContext` is passed as second parameter to all event handlers
-- `ctx.models` is used to resolve and compare models
+- `ctx.models` is used to resolve and compare models; `ctx.models.list()` additionally seeds the `/scribe-model` picker and its argument completions
 - `ctx.sessionManager` provides unique session identification
 - `ctx.modelRegistry` and `ctx.localProtocolOptions` enable nested sessions
 - `ctx.cwd` is passed to nested session for file operations
+- `ctx.hasUI` gates every footer write, notification, and the `/scribe-model` picker; without a UI the extension still tracks and swaps state, it just reports nothing
 
 ### Model Resolution & Caching
 
@@ -935,19 +1044,22 @@ if (input.content.trim() === PLACEHOLDER_CONTENT) {
 
 ### Contract Invariant: Tool Execution Order
 
-**File: `index.ts` (directive, lines 34-47)**
+**File: `index.ts` (directive)**
 
 ```typescript
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/criticalFiles/verification/assumptions, plus an \`approach\` array holding one Tokenized Architectural Diff (TAD) line per ordered change step:
-   ${TAD_LINE_SHAPE}
-   - \`@path\` — project-relative file the step edits.
-   - \`[start-end]\` — inclusive 1-based line range to touch; omit it entirely for a file that does not exist yet.
-   - \`{+}\` new file or added section, \`{!}\` deletion, \`{~}\` modification.
-   - \`deps(...)\` — project-relative files whose contract this step depends on; may be empty.
-   - \`#intent\` — snake_case label naming the step.
-   Never paste file content or line bodies into a step: the extension reads the referenced lines from disk for the writer model.
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`files\` and \`steps\` arrays:
+   files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
+   steps entries are [fileId, operation, range, intent, preserve, doNot]:
+   - \`fileId\` — must match an id in \`files\`.
+   - \`operation\` — "+" add, "!" delete, "~" modify.
+   - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
+   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
+   - \`preserve\` — array of things that must keep working; empty array when none.
+   - \`doNot\` — array of explicit prohibitions; empty array when none.
+   Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
+   Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
 3. Then continue the normal \`xd://propose\` submission with that slug, as usual.
 Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
@@ -955,38 +1067,71 @@ Never draft the Markdown plan body yourself, at any point in this turn. If \`${B
 ```
 
 **Pattern:**
-- Directive is injected into system prompt to enforce call ordering
-- Model is told: blueprint tool first, then write, then propose
-- Violations are detected in `tool_call` handler (write without markdown)
+- Directive is injected into the system prompt to enforce call ordering
+- Model is told: blueprint tool first, then `write`, then propose
+- The `files`/`steps` tuple shape — including a worked one-step example — is spelled out in the directive, so the model never has to infer the IR or guess field order
+- Violations are detected in the `tool_call` handler (placeholder write with no drafted Markdown)
 - The contract is human-readable and tied to specific tool names
+- `DOC_SCRIBE_DIRECTIVE` enforces the analogous order for doc mode: call `propose_doc_blueprint` exactly once, then `write` the declared path with the placeholder — never compose the body directly
 
-### Stateful Caching: Session + Slug Keys
+### Stateful Caching: Process-Wide Stores
 
-**File: `index.ts` (lines 27-31, 89, 134-135)**
+**File: `config.ts` (stores) & `index.ts` (use)**
 
 ```typescript
-const pendingMarkdown = new Map<string, string>();  // Maps "${sessionId}:${slug}" -> markdown
+// config.ts — globalThis-backed singletons, shared by every factory closure
+export function pendingMarkdownStore(): Map<string, PendingBlueprint> { /* ... */ }
+export function pendingDocMarkdownStore(): Map<string, PendingBlueprint> { /* ... */ }
 
-const sessionKey = (ctx: ExtensionContext): string => 
-  ctx.sessionManager.getSessionId?.() ?? "default";
+// In the blueprint tool's execute:
+pendingMarkdownStore().set(blueprint.slug, {
+  sessionKey: sessionKey(ctx), markdown: result.markdown, /* writerModel, writerUsage, writerCostUsd */
+});
 
-// In blueprint tool:
-pendingMarkdown.set(`${sessionKey(ctx)}:${blueprint.slug}`, result.markdown);
-
-// In tool_call handler:
-const key = `${sessionKey(ctx)}:${slug}`;
-const markdown = pendingMarkdown.get(key);
-if (markdown !== undefined) {
-  pendingMarkdown.delete(key);  // Consume exactly once
-  return { input: { ...input, content: markdown } };
+// In the tool_call handler:
+const resolved = pendingPlanEntry(pendingMarkdownStore(), sessionKey(ctx), target);
+if (resolved !== undefined) {
+  const { key, entry } = resolved;
+  pendingMarkdownStore().delete(key);   // Consume exactly once
+  return { input: { ...input, content: entry.markdown } };
 }
 ```
 
 **Pattern:**
-- Cache key is `${sessionId}:${slug}` to isolate multiple sessions and plans
-- Lookup is keyed by both session and slug from the write call
-- Cache is consumed exactly once (deleted after use)
-- Prevents accidental reuse or collision across different plans/sessions
+- Keys are the draft's own slug (plan) or declared write target (doc); plan and doc drafts cannot collide because they live in separate stores
+- Session ownership is carried inside the entry (`entry.sessionKey`) and checked by `pendingPlanEntry()`/`pendingDocEntry()` before a key is matched, so concurrent sessions never see each other's drafts
+- Consumption is exactly-once: the entry is deleted before the swapped input is returned
+- Storing the maps on `globalThis` keeps one instance per process even across duplicated module imports or hot reloads
+
+### Scribe IR Structural Validation
+
+**File: `scribe-ir.ts`**
+
+The tool's Zod schema can only assert that each `files`/`steps` entry is an array of the right length, so per-field semantics are enforced by a hand-written validator that throws on the *first* violation:
+
+```typescript
+blueprint.steps.forEach((entry, index) => {
+  if (!Array.isArray(entry) || entry.length !== 6) {
+    throw new Error(`steps[${index}]: must be a 6-element [fileId, operation, range, intent, preserve, doNot] tuple.`);
+  }
+  const [fileId, operation, range, intent, preserve, doNot] = entry;
+  if (typeof fileId !== "string" || !seenIds.has(fileId)) {
+    throw new Error(`steps[${index}]: references unknown file id ${JSON.stringify(fileId)}.`);
+  }
+  if (operation !== "+" && operation !== "!" && operation !== "~") {
+    throw new Error(`steps[${index}] (file ${JSON.stringify(fileId)}): invalid operation ${JSON.stringify(operation)}; expected "+", "!", or "~".`);
+  }
+  if (range !== null) {
+    // …must be [start, end]; start a positive integer; end >= start…
+  }
+});
+```
+
+**Pattern:**
+- Every message names the offending index and, where known, the file id, so the planning model can correct exactly one thing and resubmit
+- Validation is strict and total: it runs before any step is resolved or read from disk, and it never silently repairs malformed IR
+- Cross-field checks the schema genuinely cannot express (does this `fileId` appear in `files`? is this `range` inverted?) live here, which is why `resolveScribeSteps()` is documented as call-after-validate
+- `expandBlueprintToMarkdown` catches the throw and returns it as `{ error }`, preserving the module's "errors are return values" contract
 
 ---
 
@@ -994,7 +1139,7 @@ if (markdown !== undefined) {
 
 1. **Async: Promises over callbacks.** Event streams wrap in `Promise` for awaitable code; finally-blocks guarantee resource cleanup.
 
-2. **Errors: Return values over exceptions.** Discriminated unions (`Result<T>`) for normal-path errors; exceptions only for truly unexpected failures.
+2. **Errors: Return values over exceptions.** Discriminated unions (`Result<T>`) for normal-path errors; exceptions only for truly unexpected failures. The success variant now also carries pricing/attribution metadata (`model`, `usage`, `costUsd`), which the write-swap handler turns into a persisted savings run.
 
 3. **Types: Strict mode, type guards at boundaries.** Type-only imports; unknown inputs narrowed to typed values; Zod validation at tool parameters.
 
@@ -1004,7 +1149,7 @@ if (markdown !== undefined) {
 
 6. **Events: Declarative binding, closure capture for state.** All handlers registered in factory; shared state via module variables.
 
-7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, tool schemas all prevent invalid states.
+7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, and tool schemas all prevent invalid states, and `validateScribeBlueprint` now enforces the per-field Scribe IR contract that a single regex previously covered only partially.
 
 8. **Injection: Host provides SDK singletons via `pi` namespace.** Never import the SDK directly; use injected `pi` to access live singletons.
 
