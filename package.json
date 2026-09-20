@@ -3,8 +3,17 @@
   "version": "1.0.0",
   "description": "Splits oh-my-pi plan-mode drafting: an expensive model emits a compact JSON blueprint, a cheap model expands it into the Markdown plan file.",
   "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mtakaki/omp-scribe.git"
+  },
+  "homepage": "https://github.com/mtakaki/omp-scribe#readme",
+  "bugs": {
+    "url": "https://github.com/mtakaki/omp-scribe/issues"
+  },
   "files": [
-    "src"
+    "dist"
   ],
   "main": "dist/index.js",
   "scripts": {
@@ -12,7 +21,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "bun test",
     "verify-load": "node scripts/verify-load.mjs",
-    "link:local": "omp plugin link ."
+    "link:local": "omp plugin link .",
+    "prepublishOnly": "npm run build"
   },
   "omp": {
     "extensions": [
