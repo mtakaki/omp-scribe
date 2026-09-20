@@ -1,25 +1,48 @@
-/** One critical-file pointer in the compact blueprint. */
-export interface PlanBlueprintFile {
-  path: string;
-  reason: string;
-}
+/**
+ * Scribe IR intentionally uses positional tuples rather than repeated
+ * object keys. The blueprint is emitted by the expensive planning model,
+ * so structural repetition costs tokens. Semantic content remains explicit
+ * in `intent`, `preserve`, and `doNot`.
+ */
+export type ScribeOperation = "+" | "!" | "~";
+
+/** [id, path, reason] — a file the plan touches. `id` is a short label the
+ *  `steps` array references; `path` is project-relative; `reason` is a
+ *  one-line note on why the file matters. */
+export type ScribeFile = readonly [id: string, path: string, reason: string];
+
+/** [start, end] — an inclusive 1-based line range. */
+export type ScribeRange = readonly [start: number, end: number];
+
+/**
+ * [fileId, operation, range, intent, preserve, doNot] — one ordered change
+ * step. `range` is `null` when no existing range applies (e.g. a new file).
+ * `intent` is a concise natural-language sentence, never an abbreviation.
+ * `preserve`/`doNot` may be empty arrays.
+ */
+export type ScribeStep = readonly [
+  fileId: string,
+  operation: ScribeOperation,
+  range: ScribeRange | null,
+  intent: string,
+  preserve: readonly string[],
+  doNot: readonly string[],
+];
 
 /** The compact JSON blueprint the expensive model submits instead of Markdown prose.
  *  Field names mirror the plan-document contract (Context/Approach/Critical files/
- *  Verification/Assumptions) already used by native plan mode. */
+ *  Verification/Assumptions) already used by native plan mode. `files` and `steps`
+ *  are the Scribe IR (see `src/scribe-ir.ts`); the extension validates, resolves,
+ *  and hydrates them from disk before delegating Markdown expansion, so the brain
+ *  model never restates file content or TAD syntax. */
 export interface PlanBlueprint {
   slug: string;
   title: string;
   context: string;
-  /** Ordered load-bearing steps, each a Tokenized Architectural Diff (TAD) line —
-   *  `@path/to/file.ext:start[-end]{+|!|~}deps(dep/a.ts,dep/b.ts)#snake_case_intent`
-   *  (see `src/tad.ts`). The line range is omitted for a file that does not exist
-   *  yet. The extension hydrates each referenced range from disk before delegating the
-   *  Markdown expansion, so the brain model never restates file content. */
-  approach: string[];
-  criticalFiles: PlanBlueprintFile[];
-  verification: string[];
-  assumptions: string[];
+  files: readonly ScribeFile[];
+  steps: readonly ScribeStep[];
+  verification: readonly string[];
+  assumptions: readonly string[];
 }
 
 /** One section in the compact document blueprint. */

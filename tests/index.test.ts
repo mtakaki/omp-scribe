@@ -16,8 +16,9 @@ import { readStatsFile } from "../src/stats-store";
 import { createFakeExtensionApi, createFakeExtensionContext, customMessageEntry, makeModel, modeChangeEntry, type FakeExtensionApi } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
-/** Shared example TAD-line literal reused across blueprint fixtures. */
-const EXAMPLE_TAD_LINE = "@src/example.ts:1-2{~}deps()#example_intent";
+/** Shared example files/steps tuples reused across blueprint fixtures. */
+const EXAMPLE_FILES = [["E", "src/example.ts", "example file"]] as const;
+const EXAMPLE_STEPS = [["E", "~", [1, 2], "Update the example export to describe the change under test.", [], []]] as const;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -311,8 +312,8 @@ describe("scribe: message_end", () => {
       slug: "acc-test",
       title: "Acc Test",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["pass"],
       assumptions: [],
     };
@@ -364,8 +365,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "my-plan",
       title: "My Plan",
       context: "Context sentence.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["bun test"],
       assumptions: [],
     };
@@ -397,7 +398,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "lean-plan",
       title: "Lean Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
     };
     const result = await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "bp-lean", minimal, ctx) as Record<string, unknown>;
 
@@ -419,8 +421,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "failing-plan",
       title: "Failing",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -449,8 +451,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "swapped-plan",
       title: "Swapped Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["pass"],
       assumptions: [],
     };
@@ -482,8 +484,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "dup-plan",
       title: "Dup Plan",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -564,8 +566,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "plan-alias",
       title: "Plan Alias",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -592,8 +594,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "right-slug",
       title: "Right",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -625,8 +627,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "first-slug",
       title: "First",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -655,8 +657,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "my_slug",
       title: "Under",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -762,8 +764,8 @@ describe("scribe: local model cost regression", () => {
       slug: "local-model-plan",
       title: "Local Model Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -815,8 +817,8 @@ describe("scribe: local model cost regression", () => {
         slug: "local-model-plan",
         title: "Local Model Plan",
         context: "Context.",
-        approach: [EXAMPLE_TAD_LINE],
-        criticalFiles: [],
+        files: EXAMPLE_FILES,
+        steps: EXAMPLE_STEPS,
         verification: ["v"],
         assumptions: [],
       },
@@ -1289,7 +1291,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-plan",
-      { slug: "status-plan", title: "Status Plan", context: "C.", approach: [EXAMPLE_TAD_LINE] },
+      { slug: "status-plan", title: "Status Plan", context: "C.", files: EXAMPLE_FILES, steps: EXAMPLE_STEPS },
       ctx,
     );
     expect(statuses.get("scribe")).toBe(
@@ -1309,7 +1311,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-fail",
-      { slug: "fail-plan", title: "Fail", context: "C.", approach: [EXAMPLE_TAD_LINE] },
+      { slug: "fail-plan", title: "Fail", context: "C.", files: EXAMPLE_FILES, steps: EXAMPLE_STEPS },
       ctx,
     );
 
