@@ -28,7 +28,7 @@ import {
 import type { DocBlueprint, PlanBlueprint } from "./types";
 import { expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "./writer-session";
 import { computeCosts } from "./pricing";
-import { appendSavingsRun, formatSavingsDashboard, readStatsFile, type SavingsRunLogEntry } from "./stats-store";
+import { appendSavingsRun, estimateBlueprintTokens, formatSavingsDashboard, readStatsFile, type SavingsRunLogEntry } from "./stats-store";
 
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
@@ -210,6 +210,7 @@ export default function scribe(pi: ExtensionAPI): void {
         writerModel: result.model,
         writerUsage: result.usage,
         writerCostUsd: result.costUsd,
+        irOutputTokens: estimateBlueprintTokens(params),
       });
 
       showStatus(ctx, {
@@ -273,6 +274,7 @@ export default function scribe(pi: ExtensionAPI): void {
         writerModel: result.model,
         writerUsage: result.usage,
         writerCostUsd: result.costUsd,
+        irOutputTokens: estimateBlueprintTokens(params),
         slug: blueprint.slug,
       });
       docDraftHistory().set(blueprint.path, sessionKey(ctx));
@@ -398,6 +400,7 @@ export default function scribe(pi: ExtensionAPI): void {
           netSavingsUsd: costs.netSavingsUsd,
           priced: costs.priced,
           baselineIsEstimate: costs.baselineIsEstimate,
+          irOutputTokens: entry.irOutputTokens,
         };
         try {
           await appendSavingsRun(ctx.cwd, runEntry);
@@ -474,6 +477,7 @@ export default function scribe(pi: ExtensionAPI): void {
         netSavingsUsd: costs.netSavingsUsd,
         priced: costs.priced,
         baselineIsEstimate: costs.baselineIsEstimate,
+        irOutputTokens: docEntry.irOutputTokens,
       };
       try {
         await appendSavingsRun(ctx.cwd, runEntry);

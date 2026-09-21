@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import scribe from "../src/index";
 import { BLUEPRINT_TOOL_NAME, DOC_BLUEPRINT_TOOL_NAME, consumedWriteSwaps, pendingMarkdownStore, armedDocSessions, pendingDocMarkdownStore, docDraftHistory, readPersistedScribeConfig, SCRIBE_MODEL_CONFIG_RELATIVE_PATH, scribeModelConfigPath } from "../src/config";
-import { readStatsFile } from "../src/stats-store";
+import { formatSavingsDashboard, readStatsFile } from "../src/stats-store";
 import { createFakeExtensionApi, createFakeExtensionContext, customMessageEntry, makeModel, modeChangeEntry, type FakeExtensionApi } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
@@ -329,6 +329,19 @@ describe("scribe: message_end", () => {
     // Brain tokens: 100+200 input, 20+30 output
     expect(stats.totalBrainInputTokens).toBe(300);
     expect(stats.totalBrainOutputTokens).toBe(50);
+
+    // The submitted blueprint is recorded as the scribe-specific output the brain
+    // had to emit in place of the document body.
+    const blueprintTokens = Math.round(JSON.stringify(blueprint).length / 4);
+    expect(stats.totalIrOutputTokens).toBe(blueprintTokens);
+
+    // Without scribe the brain would have emitted the writer's document instead of
+    // the blueprint, so the dashboard trades one for the other.
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    const withoutScribe = stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - blueprintTokens;
+    expect(row).toContain(withoutScribe.toLocaleString("en-US"));
   });
 
   it("does not accumulate usage for non-assistant messages", async () => {
@@ -683,6 +696,7 @@ describe("scribe: session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
     pendingMarkdownStore().set("slug-b", {
       sessionKey: "session-B",
@@ -690,6 +704,7 @@ describe("scribe: session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
 
     const { ctx } = createFakeExtensionContext({ sessionId: "session-A" });
@@ -1073,6 +1088,8 @@ describe("scribe: doc-mode tool_call write swap", () => {
     expect(stats.totalPlanRuns).toBe(0);
     expect(stats.runs[0]!.mode).toBe("doc");
     expect(stats.runs[0]!.slug).toBe("arch-doc");
+    // Doc blueprints are billed the same way: the outline JSON is scribe-specific output.
+    expect(stats.totalIrOutputTokens).toBe(Math.round(JSON.stringify(blueprint).length / 4));
   });
 
   it("duplicate toolCallId for doc write returns cached swap (idempotent delivery)", async () => {
@@ -1173,6 +1190,7 @@ describe("scribe: doc-mode session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
     pendingDocMarkdownStore().set("b.md", {
       sessionKey: "session-B",
@@ -1180,6 +1198,7 @@ describe("scribe: doc-mode session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
 
     const { ctx } = createFakeExtensionContext({ sessionId: "session-A" });

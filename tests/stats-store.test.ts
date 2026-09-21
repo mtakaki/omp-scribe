@@ -22,6 +22,7 @@ function makeEntry(overrides: Partial<SavingsRunLogEntry> = {}): SavingsRunLogEn
     brainOutputTokens: 50,
     writerInputTokens: 2000,
     writerOutputTokens: 300,
+    irOutputTokens: 42,
     writerCostUsd: 0,
     actualCostUsd: 0.001,
     baselineCostUsd: 0.010,
@@ -115,6 +116,14 @@ describe("appendSavingsRun", () => {
     const stats = await readStatsFile(cwd);
     expect(stats.totalRuns).toBe(3);
     expect(stats.totalEstimatedBaselineRuns).toBe(2);
+  });
+
+  it("accumulates blueprint tokens, treating entries without the field as zero", async () => {
+    await appendSavingsRun(cwd, makeEntry({ irOutputTokens: 120 }));
+    const legacy = makeEntry();
+    delete legacy.irOutputTokens;
+    const stats = await appendSavingsRun(cwd, legacy);
+    expect(stats.totalIrOutputTokens).toBe(120);
   });
 
   it("prepends new entries (most-recent-first)", async () => {
@@ -214,6 +223,47 @@ describe("formatSavingsDashboard", () => {
     };
     const output = formatSavingsDashboard(stats);
     expect(output).toContain("no known per-token output rate in the catalog");
+  });
+
+  it("estimates brain output without scribe by trading the blueprint for the writer's document", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 1,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 3000,
+      totalIrOutputTokens: 400,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    expect(row).toContain("4,600");
+  });
+
+  it("falls back to brain + writer output when a pre-existing file lacks the blueprint total", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 1,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 3000,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    expect(row).toContain("5,000");
   });
 
   it("flags an @plan-role estimated baseline with a ~$ marker and note", () => {

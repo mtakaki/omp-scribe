@@ -18,6 +18,9 @@ export interface SavingsRunLogEntry {
   brainOutputTokens: number;
   writerInputTokens: number;
   writerOutputTokens: number;
+  /** Estimated tokens the brain spent emitting the compact blueprint JSON instead
+   *  of the document body; absent in legacy entries (treat as 0). */
+  irOutputTokens?: number;
   /** Actual cost in USD charged by the writer model alone for this run
    *  (sourced from ExpandResult.costUsd); zero for local/free writer models. */
   writerCostUsd: number;
@@ -62,6 +65,9 @@ export interface SavingsStatsFile {
   /** Count of runs whose baseline was estimated from the `@plan`-role reference
    *  model; optional for backward compat with earlier files. */
   totalEstimatedBaselineRuns?: number;
+  /** Cumulative blueprint tokens the brain emitted instead of the document
+   *  body; optional for backward compat with earlier files. */
+  totalIrOutputTokens?: number;
   /** Most-recent runs first; capped at 200. */
   runs: SavingsRunLogEntry[];
 }
@@ -86,6 +92,7 @@ function emptyStatsFile(): SavingsStatsFile {
     totalFreeWriterNetSavingsUsd: 0,
     totalPaidWriterNetSavingsUsd: 0,
     totalEstimatedBaselineRuns: 0,
+    totalIrOutputTokens: 0,
     runs: [],
   };
 }
@@ -140,6 +147,7 @@ export async function appendSavingsRun(cwd: string, entry: SavingsRunLogEntry): 
     totalFreeWriterNetSavingsUsd: (current.totalFreeWriterNetSavingsUsd ?? 0) + (isFreeWriter ? entry.netSavingsUsd : 0),
     totalPaidWriterNetSavingsUsd: (current.totalPaidWriterNetSavingsUsd ?? 0) + (isFreeWriter ? 0 : entry.netSavingsUsd),
     totalEstimatedBaselineRuns: (current.totalEstimatedBaselineRuns ?? 0) + (entry.baselineIsEstimate ? 1 : 0),
+    totalIrOutputTokens: (current.totalIrOutputTokens ?? 0) + (entry.irOutputTokens ?? 0),
     runs: [entry, ...current.runs].slice(0, 200),
   };
 
@@ -174,6 +182,14 @@ function dataRow(label: string, value: string): string {
   return `║${content}║`;
 }
 
+/** Estimated token count of a compact blueprint JSON payload, at ~4 characters
+ *  per token.  Subtracted from the brain's output when reporting how much it
+ *  would have emitted had it authored the document body itself, since the
+ *  blueprint exists only because of scribe. */
+export function estimateBlueprintTokens(blueprint: unknown): number {
+  return Math.round(JSON.stringify(blueprint).length / 4);
+}
+
 /** Render a full ASCII dashboard of `stats` as a multi-line string.
  *
  *  Box outer width: 66 chars (64 inner + 2 border columns).
@@ -184,6 +200,10 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
   const estimatedRuns = stats.totalEstimatedBaselineRuns ?? 0;
   /** Aggregate savings carry a `~` while any contributing baseline is an estimate. */
   const estimateMark = estimatedRuns > 0 ? "~" : "";
+  /** Without scribe the brain emits the document body in place of the blueprint,
+   *  so re-add what the writer produced and drop what the blueprint cost. */
+  const estimatedBrainOutputTokens =
+    stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - (stats.totalIrOutputTokens ?? 0);
   const usd = (n: number) => `$${n.toFixed(4)}`;
   const num = (n: number) => n.toLocaleString("en-US");
 
@@ -203,6 +223,7 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     dataRow("Brain tokens output", num(stats.totalBrainOutputTokens)),
     dataRow("Writer tokens input", num(stats.totalWriterInputTokens)),
     dataRow("Writer tokens output", num(stats.totalWriterOutputTokens)),
+    dataRow("Estimated brain tokens output without scribe", num(estimatedBrainOutputTokens)),
     SEP,
     dataRow("Free/local writer runs", num(stats.totalFreeWriterRuns ?? 0)),
     dataRow("Paid (remote) writer runs", num(stats.totalPaidWriterRuns ?? 0)),

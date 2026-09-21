@@ -247,6 +247,10 @@ export interface PendingBlueprint {
   /** Actual cost in USD charged by the writer model for this expansion
    *  (sourced from `usage.cost.total` in the nested session). */
   writerCostUsd: number;
+  /** Estimated tokens the brain spent emitting the compact blueprint JSON
+   *  rather than the document body (see `estimateBlueprintTokens`), carried
+   *  here so the savings log can report the without-scribe counterfactual. */
+  irOutputTokens: number;
   /** Blueprint slug, stored for doc-mode entries (whose map key is the write
    *  target path) so the savings recent-run log can name the draft.
    *  Optional: plan-mode entries omit it (the slug is already the map key). */
