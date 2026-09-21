@@ -18,6 +18,9 @@ export interface SavingsRunLogEntry {
   brainOutputTokens: number;
   writerInputTokens: number;
   writerOutputTokens: number;
+  /** Estimated tokens the brain spent emitting the compact blueprint JSON instead
+   *  of the document body; absent in legacy entries (treat as 0). */
+  irOutputTokens?: number;
   /** Actual cost in USD charged by the writer model alone for this run
    *  (sourced from ExpandResult.costUsd); zero for local/free writer models. */
   writerCostUsd: number;
@@ -62,6 +65,18 @@ export interface SavingsStatsFile {
   /** Count of runs whose baseline was estimated from the `@plan`-role reference
    *  model; optional for backward compat with earlier files. */
   totalEstimatedBaselineRuns?: number;
+  /** Cumulative blueprint tokens the brain emitted instead of the document
+   *  body; optional for backward compat with earlier files. */
+  totalIrOutputTokens?: number;
+  /** Total count of blueprint tool calls: incremented once per successful run
+   *  in `appendSavingsRun` and once per failed call in `appendBlueprintFailure`.
+   *  Required (not optional) — a pre-migration file missing this field fails
+   *  `isSavingsStatsFile` and self-heals to a zeroed structure, since there is
+   *  no way to backfill blueprint-call counts retroactively. */
+  blueprintCallsTotal: number;
+  /** Count of blueprint tool calls whose result was an error (the writer
+   *  expansion failed). Required for the same reason as `blueprintCallsTotal`. */
+  blueprintCallsFailed: number;
   /** Most-recent runs first; capped at 200. */
   runs: SavingsRunLogEntry[];
 }
@@ -86,6 +101,9 @@ function emptyStatsFile(): SavingsStatsFile {
     totalFreeWriterNetSavingsUsd: 0,
     totalPaidWriterNetSavingsUsd: 0,
     totalEstimatedBaselineRuns: 0,
+    totalIrOutputTokens: 0,
+    blueprintCallsTotal: 0,
+    blueprintCallsFailed: 0,
     runs: [],
   };
 }
@@ -93,7 +111,13 @@ function emptyStatsFile(): SavingsStatsFile {
 function isSavingsStatsFile(value: unknown): value is SavingsStatsFile {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return v["version"] === 1 && Array.isArray(v["runs"]) && typeof v["totalRuns"] === "number";
+  return (
+    v["version"] === 1 &&
+    Array.isArray(v["runs"]) &&
+    typeof v["totalRuns"] === "number" &&
+    typeof v["blueprintCallsTotal"] === "number" &&
+    typeof v["blueprintCallsFailed"] === "number"
+  );
 }
 
 function statsFilePath(cwd: string): string {
@@ -140,7 +164,31 @@ export async function appendSavingsRun(cwd: string, entry: SavingsRunLogEntry): 
     totalFreeWriterNetSavingsUsd: (current.totalFreeWriterNetSavingsUsd ?? 0) + (isFreeWriter ? entry.netSavingsUsd : 0),
     totalPaidWriterNetSavingsUsd: (current.totalPaidWriterNetSavingsUsd ?? 0) + (isFreeWriter ? 0 : entry.netSavingsUsd),
     totalEstimatedBaselineRuns: (current.totalEstimatedBaselineRuns ?? 0) + (entry.baselineIsEstimate ? 1 : 0),
+    totalIrOutputTokens: (current.totalIrOutputTokens ?? 0) + (entry.irOutputTokens ?? 0),
+    blueprintCallsTotal: current.blueprintCallsTotal + 1,
+    blueprintCallsFailed: current.blueprintCallsFailed,
     runs: [entry, ...current.runs].slice(0, 200),
+  };
+
+  const target = statsFilePath(cwd);
+  await mkdir(dirname(target), { recursive: true });
+  const tmp = `${target}.tmp-${process.pid}-${randomUUID()}`;
+  await writeFile(tmp, JSON.stringify(next, null, 2), "utf8");
+  await rename(tmp, target);
+  return next;
+}
+
+/** Atomically increments `blueprintCallsTotal` and `blueprintCallsFailed` for a
+ *  blueprint tool call whose result was an error (the writer expansion failed
+ *  before a run was ever logged via `appendSavingsRun`). Records only the
+ *  counters — no content or arguments from the failed call. Uses the same
+ *  tmp-sibling-then-rename atomic write pattern as `appendSavingsRun`. */
+export async function appendBlueprintFailure(cwd: string): Promise<SavingsStatsFile> {
+  const current = await readStatsFile(cwd);
+  const next: SavingsStatsFile = {
+    ...current,
+    blueprintCallsTotal: current.blueprintCallsTotal + 1,
+    blueprintCallsFailed: current.blueprintCallsFailed + 1,
   };
 
   const target = statsFilePath(cwd);
@@ -174,6 +222,14 @@ function dataRow(label: string, value: string): string {
   return `║${content}║`;
 }
 
+/** Estimated token count of a compact blueprint JSON payload, at ~4 characters
+ *  per token.  Subtracted from the brain's output when reporting how much it
+ *  would have emitted had it authored the document body itself, since the
+ *  blueprint exists only because of scribe. */
+export function estimateBlueprintTokens(blueprint: unknown): number {
+  return Math.round(JSON.stringify(blueprint).length / 4);
+}
+
 /** Render a full ASCII dashboard of `stats` as a multi-line string.
  *
  *  Box outer width: 66 chars (64 inner + 2 border columns).
@@ -184,8 +240,19 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
   const estimatedRuns = stats.totalEstimatedBaselineRuns ?? 0;
   /** Aggregate savings carry a `~` while any contributing baseline is an estimate. */
   const estimateMark = estimatedRuns > 0 ? "~" : "";
+  /** Without scribe the brain emits the document body in place of the blueprint,
+   *  so re-add what the writer produced and drop what the blueprint cost. */
+  const estimatedBrainOutputTokens =
+    stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - (stats.totalIrOutputTokens ?? 0);
   const usd = (n: number) => `$${n.toFixed(4)}`;
   const num = (n: number) => n.toLocaleString("en-US");
+  const blueprintCallsTotal = stats.blueprintCallsTotal ?? 0;
+  const blueprintCallsFailed = stats.blueprintCallsFailed ?? 0;
+  const blueprintCallsPassed = blueprintCallsTotal - blueprintCallsFailed;
+  const blueprintReliability =
+    blueprintCallsTotal === 0
+      ? "n/a"
+      : `${num(blueprintCallsPassed)}/${num(blueprintCallsTotal)} (${Math.round((blueprintCallsPassed / blueprintCallsTotal) * 100)}%)`;
 
   const lines: string[] = [
     TOP,
@@ -198,11 +265,13 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     dataRow("Total net savings", `${estimateMark}${usd(stats.totalNetSavingsUsd)}`),
     dataRow("Avg. savings / run", `${estimateMark}${usd(avgSavings)}`),
     dataRow("Baseline via @plan-role estimate", num(estimatedRuns)),
+    dataRow("Blueprint reliability (first-try)", blueprintReliability),
     SEP,
     dataRow("Brain tokens input", num(stats.totalBrainInputTokens)),
     dataRow("Brain tokens output", num(stats.totalBrainOutputTokens)),
     dataRow("Writer tokens input", num(stats.totalWriterInputTokens)),
     dataRow("Writer tokens output", num(stats.totalWriterOutputTokens)),
+    dataRow("Estimated brain tokens output without scribe", num(estimatedBrainOutputTokens)),
     SEP,
     dataRow("Free/local writer runs", num(stats.totalFreeWriterRuns ?? 0)),
     dataRow("Paid (remote) writer runs", num(stats.totalPaidWriterRuns ?? 0)),

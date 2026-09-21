@@ -12,12 +12,13 @@ import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import scribe from "../src/index";
 import { BLUEPRINT_TOOL_NAME, DOC_BLUEPRINT_TOOL_NAME, consumedWriteSwaps, pendingMarkdownStore, armedDocSessions, pendingDocMarkdownStore, docDraftHistory, readPersistedScribeConfig, SCRIBE_MODEL_CONFIG_RELATIVE_PATH, scribeModelConfigPath } from "../src/config";
-import { readStatsFile } from "../src/stats-store";
+import { formatSavingsDashboard, readStatsFile } from "../src/stats-store";
 import { createFakeExtensionApi, createFakeExtensionContext, customMessageEntry, makeModel, modeChangeEntry, type FakeExtensionApi } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
-/** Shared example TAD-line literal reused across blueprint fixtures. */
-const EXAMPLE_TAD_LINE = "@src/example.ts:1-2{~}deps()#example_intent";
+/** Shared example files/steps tuples reused across blueprint fixtures. */
+const EXAMPLE_FILES = [["E", "src/example.ts", "example file"]] as const;
+const EXAMPLE_STEPS = [["E", "~", [1, 2], "Update the example export to describe the change under test.", [], []]] as const;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -311,8 +312,8 @@ describe("scribe: message_end", () => {
       slug: "acc-test",
       title: "Acc Test",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["pass"],
       assumptions: [],
     };
@@ -328,6 +329,19 @@ describe("scribe: message_end", () => {
     // Brain tokens: 100+200 input, 20+30 output
     expect(stats.totalBrainInputTokens).toBe(300);
     expect(stats.totalBrainOutputTokens).toBe(50);
+
+    // The submitted blueprint is recorded as the scribe-specific output the brain
+    // had to emit in place of the document body.
+    const blueprintTokens = Math.round(JSON.stringify(blueprint).length / 4);
+    expect(stats.totalIrOutputTokens).toBe(blueprintTokens);
+
+    // Without scribe the brain would have emitted the writer's document instead of
+    // the blueprint, so the dashboard trades one for the other.
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    const withoutScribe = stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - blueprintTokens;
+    expect(row).toContain(withoutScribe.toLocaleString("en-US"));
   });
 
   it("does not accumulate usage for non-assistant messages", async () => {
@@ -364,8 +378,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "my-plan",
       title: "My Plan",
       context: "Context sentence.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["bun test"],
       assumptions: [],
     };
@@ -397,7 +411,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "lean-plan",
       title: "Lean Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
     };
     const result = await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "bp-lean", minimal, ctx) as Record<string, unknown>;
 
@@ -419,8 +434,8 @@ describe("scribe: propose_plan_blueprint execute", () => {
       slug: "failing-plan",
       title: "Failing",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -449,8 +464,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "swapped-plan",
       title: "Swapped Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["pass"],
       assumptions: [],
     };
@@ -482,8 +497,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "dup-plan",
       title: "Dup Plan",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -564,8 +579,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "plan-alias",
       title: "Plan Alias",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -592,8 +607,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "right-slug",
       title: "Right",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -625,8 +640,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "first-slug",
       title: "First",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -655,8 +670,8 @@ describe("scribe: tool_call write swap", () => {
       slug: "my_slug",
       title: "Under",
       context: "C.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -681,6 +696,7 @@ describe("scribe: session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
     pendingMarkdownStore().set("slug-b", {
       sessionKey: "session-B",
@@ -688,6 +704,7 @@ describe("scribe: session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
 
     const { ctx } = createFakeExtensionContext({ sessionId: "session-A" });
@@ -730,6 +747,86 @@ describe("scribe: /savings command", () => {
   });
 });
 
+// ─── tool_result blueprint-failure tracking ───────────────────────────────────
+
+describe("scribe: tool_result blueprint-failure tracking", () => {
+  it("increments blueprintCallsTotal and blueprintCallsFailed when propose_plan_blueprint errors", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-fail-1",
+      toolName: BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Blueprint expansion failed: writer model did not resolve" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+
+  it("increments blueprintCallsTotal and blueprintCallsFailed when propose_doc_blueprint errors", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-fail-2",
+      toolName: DOC_BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Doc blueprint expansion failed" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+
+  it("ignores a successful blueprint tool_result", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-ok-1",
+      toolName: BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Blueprint accepted" }],
+      isError: false,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(0);
+    expect(stats.blueprintCallsFailed).toBe(0);
+  });
+
+  it("ignores tool_result events from unrelated tools", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-other-1",
+      toolName: "write",
+      input: {},
+      content: [{ type: "text", text: "some error" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(0);
+    expect(stats.blueprintCallsFailed).toBe(0);
+  });
+});
+
 // ─── Local model regression (cost=0 must not misreport as nonzero) ─────────────
 
 describe("scribe: local model cost regression", () => {
@@ -762,8 +859,8 @@ describe("scribe: local model cost regression", () => {
       slug: "local-model-plan",
       title: "Local Model Plan",
       context: "Context.",
-      approach: [EXAMPLE_TAD_LINE],
-      criticalFiles: [],
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
       verification: ["v"],
       assumptions: [],
     };
@@ -815,8 +912,8 @@ describe("scribe: local model cost regression", () => {
         slug: "local-model-plan",
         title: "Local Model Plan",
         context: "Context.",
-        approach: [EXAMPLE_TAD_LINE],
-        criticalFiles: [],
+        files: EXAMPLE_FILES,
+        steps: EXAMPLE_STEPS,
         verification: ["v"],
         assumptions: [],
       },
@@ -1071,6 +1168,8 @@ describe("scribe: doc-mode tool_call write swap", () => {
     expect(stats.totalPlanRuns).toBe(0);
     expect(stats.runs[0]!.mode).toBe("doc");
     expect(stats.runs[0]!.slug).toBe("arch-doc");
+    // Doc blueprints are billed the same way: the outline JSON is scribe-specific output.
+    expect(stats.totalIrOutputTokens).toBe(Math.round(JSON.stringify(blueprint).length / 4));
   });
 
   it("duplicate toolCallId for doc write returns cached swap (idempotent delivery)", async () => {
@@ -1171,6 +1270,7 @@ describe("scribe: doc-mode session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
     pendingDocMarkdownStore().set("b.md", {
       sessionKey: "session-B",
@@ -1178,6 +1278,7 @@ describe("scribe: doc-mode session_shutdown", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
 
     const { ctx } = createFakeExtensionContext({ sessionId: "session-A" });
@@ -1289,7 +1390,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-plan",
-      { slug: "status-plan", title: "Status Plan", context: "C.", approach: [EXAMPLE_TAD_LINE] },
+      { slug: "status-plan", title: "Status Plan", context: "C.", files: EXAMPLE_FILES, steps: EXAMPLE_STEPS },
       ctx,
     );
     expect(statuses.get("scribe")).toBe(
@@ -1309,7 +1410,7 @@ describe("scribe: footer status", () => {
     await fakeApi.callTool(
       BLUEPRINT_TOOL_NAME,
       "tcid-status-fail",
-      { slug: "fail-plan", title: "Fail", context: "C.", approach: [EXAMPLE_TAD_LINE] },
+      { slug: "fail-plan", title: "Fail", context: "C.", files: EXAMPLE_FILES, steps: EXAMPLE_STEPS },
       ctx,
     );
 

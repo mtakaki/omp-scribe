@@ -26,22 +26,30 @@ import {
   type ScribeStatusState,
 } from "./config";
 import type { DocBlueprint, PlanBlueprint } from "./types";
-import { TAD_LINE_RE, TAD_LINE_SHAPE } from "./tad";
 import { expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "./writer-session";
 import { computeCosts } from "./pricing";
-import { appendSavingsRun, formatSavingsDashboard, readStatsFile, type SavingsRunLogEntry } from "./stats-store";
+import {
+  appendBlueprintFailure,
+  appendSavingsRun,
+  estimateBlueprintTokens,
+  formatSavingsDashboard,
+  readStatsFile,
+  type SavingsRunLogEntry,
+} from "./stats-store";
 
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/criticalFiles/verification/assumptions, plus an \`approach\` array holding one Tokenized Architectural Diff (TAD) line per ordered change step:
-   ${TAD_LINE_SHAPE}
-   - \`@path\` — project-relative file the step edits.
-   - \`:start-end\` — inclusive 1-based line range to touch; a single line may be written as \`:N\`; omit it entirely for a file that does not exist yet.
-   - \`{+}\` new file or added section, \`{!}\` deletion, \`{~}\` modification.
-   - \`deps(...)\` — project-relative files whose contract this step depends on; may be empty.
-   - \`#intent\` — snake_case label naming the step.
-   Never paste file content or line bodies into a step: the extension reads the referenced lines from disk for the writer model.
-   Examples: \`@src/tad.ts:40-92{~}deps(src/types.ts)#widen_path_class\` and \`@frontend/app/obras/[slug]/page.tsx{+}#add_dynamic_route\`.
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`files\` and \`steps\` arrays:
+   files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
+   steps entries are [fileId, operation, range, intent, preserve, doNot]:
+   - \`fileId\` — must match an id in \`files\`.
+   - \`operation\` — "+" add, "!" delete, "~" modify.
+   - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
+   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
+   - \`preserve\` — array of things that must keep working; empty array when none.
+   - \`doNot\` — array of explicit prohibitions; empty array when none.
+   Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
+   Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
 3. Then continue the normal \`xd://propose\` submission with that slug, as usual.
 Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
@@ -57,12 +65,13 @@ Never draft the Markdown document body yourself, at any point in this turn. If \
 /** Footer status key holding the Scribe line; cleared on session shutdown. */
 const STATUS_KEY = "scribe";
 
-/** Wire-input shape of the plan blueprint tool.  The three trailing sections are
+/** Wire-input shape of the plan blueprint tool. `verification`/`assumptions` are
  *  optional so a model that omits one — models drop trailing keys when a tool
  *  call is large — still executes; `execute` fills the empty defaults in before
- *  handing the blueprint to the writer model. */
-type PlanBlueprintInput = Omit<PlanBlueprint, "criticalFiles" | "verification" | "assumptions"> &
-  Partial<Pick<PlanBlueprint, "criticalFiles" | "verification" | "assumptions">>;
+ *  handing the blueprint to the writer model. `files`/`steps` are required
+ *  (both schema-enforced `min(1)` arrays). */
+type PlanBlueprintInput = Omit<PlanBlueprint, "verification" | "assumptions"> &
+  Partial<Pick<PlanBlueprint, "verification" | "assumptions">>;
 
 export default function scribe(pi: ExtensionAPI): void {
   registerScribeFlags(pi);
@@ -144,7 +153,7 @@ export default function scribe(pi: ExtensionAPI): void {
     name: BLUEPRINT_TOOL_NAME,
     label: "Propose Plan Blueprint",
     description:
-      `Plan mode only. Submit a compact JSON architecture blueprint instead of composing the full Markdown plan yourself: plain metadata fields plus an \`approach\` array of TAD lines (${TAD_LINE_SHAPE}). A separate lightweight model expands it — with each referenced line range hydrated from disk — into the final \`local://<slug>-plan.md\` document. Call this exactly once per plan.`,
+      `Plan mode only. Submit a compact JSON architecture blueprint instead of composing the full Markdown plan yourself: plain metadata fields plus a \`files\` table ([id, path, reason]) and a \`steps\` array ([fileId, operation, range|null, intent, preserve[], doNot[]]). A separate lightweight model expands it — with each referenced line range hydrated from disk — into the final \`local://<slug>-plan.md\` document. Call this exactly once per plan.`,
     parameters: z.object({
       slug: z
         .string()
@@ -152,16 +161,18 @@ export default function scribe(pi: ExtensionAPI): void {
         .describe("Plan slug; the final file is local://<slug>-plan.md"),
       title: z.string().describe("Short plan title"),
       context: z.string().describe("2-4 sentences: literal ask, need, intended end state"),
-      approach: z
-        .array(
-          z.string().regex(TAD_LINE_RE, `Each approach entry must be a Tokenized Architectural Diff line: ${TAD_LINE_SHAPE}`),
-        )
+      files: z
+        .array(z.array(z.unknown()).min(3).max(3))
         .min(1)
-        .describe(`Ordered load-bearing change steps, one TAD line each: ${TAD_LINE_SHAPE}`),
-      criticalFiles: z
-        .array(z.object({ path: z.string(), reason: z.string() }))
-        .optional()
-        .describe("At most 5 files disambiguating non-obvious work; omit when none"),
+        .describe(
+          "Files the plan touches, each a 3-element [id, path, reason] array: id is a short label steps reference by; path is project-relative; reason is one line on why the file matters. Exact shape enforced when the blueprint tool runs.",
+        ),
+      steps: z
+        .array(z.array(z.unknown()).min(6).max(6))
+        .min(1)
+        .describe(
+          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exact shape enforced when the blueprint tool runs.`,
+        ),
       verification: z
         .array(z.string())
         .optional()
@@ -181,8 +192,8 @@ export default function scribe(pi: ExtensionAPI): void {
         slug: raw.slug,
         title: raw.title,
         context: raw.context,
-        approach: raw.approach,
-        criticalFiles: raw.criticalFiles ?? [],
+        files: raw.files,
+        steps: raw.steps,
         verification: raw.verification ?? [],
         assumptions: raw.assumptions ?? [],
       };
@@ -206,6 +217,7 @@ export default function scribe(pi: ExtensionAPI): void {
         writerModel: result.model,
         writerUsage: result.usage,
         writerCostUsd: result.costUsd,
+        irOutputTokens: estimateBlueprintTokens(params),
       });
 
       showStatus(ctx, {
@@ -269,6 +281,7 @@ export default function scribe(pi: ExtensionAPI): void {
         writerModel: result.model,
         writerUsage: result.usage,
         writerCostUsd: result.costUsd,
+        irOutputTokens: estimateBlueprintTokens(params),
         slug: blueprint.slug,
       });
       docDraftHistory().set(blueprint.path, sessionKey(ctx));
@@ -288,6 +301,19 @@ export default function scribe(pi: ExtensionAPI): void {
         details: { slug: blueprint.slug, path: blueprint.path, markdownChars: result.markdown.length, writerModel: `${result.model.provider}/${result.model.id}` },
       };
     },
+  });
+
+  // ─── tool_result blueprint-failure tracking ──────────────────────────────
+  pi.on("tool_result", async (event, ctx) => {
+    if (!event.isError) return;
+    if (event.toolName !== BLUEPRINT_TOOL_NAME && event.toolName !== DOC_BLUEPRINT_TOOL_NAME) return;
+    try {
+      await appendBlueprintFailure(ctx.cwd);
+    } catch (error) {
+      pi.logger.warn(
+        `[scribe-extension] failed to persist blueprint failure stats: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   });
 
   // ─── before_agent_start ───────────────────────────────────────────────────
@@ -394,6 +420,7 @@ export default function scribe(pi: ExtensionAPI): void {
           netSavingsUsd: costs.netSavingsUsd,
           priced: costs.priced,
           baselineIsEstimate: costs.baselineIsEstimate,
+          irOutputTokens: entry.irOutputTokens,
         };
         try {
           await appendSavingsRun(ctx.cwd, runEntry);
@@ -470,6 +497,7 @@ export default function scribe(pi: ExtensionAPI): void {
         netSavingsUsd: costs.netSavingsUsd,
         priced: costs.priced,
         baselineIsEstimate: costs.baselineIsEstimate,
+        irOutputTokens: docEntry.irOutputTokens,
       };
       try {
         await appendSavingsRun(ctx.cwd, runEntry);

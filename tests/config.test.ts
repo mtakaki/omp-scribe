@@ -155,6 +155,7 @@ function draft(sessionKey: string, markdown = "# Draft"): PendingBlueprint {
     writerModel: { provider: "anthropic", id: "haiku" },
     writerUsage: { input: 1, output: 1 },
     writerCostUsd: 0,
+    irOutputTokens: 0,
   };
 }
 
@@ -449,6 +450,7 @@ describe("pendingMarkdownStore", () => {
       writerModel: { provider: "anthropic", id: "haiku" },
       writerUsage: { input: 1, output: 1 },
       writerCostUsd: 0,
+      irOutputTokens: 0,
     });
     expect(pendingMarkdownStore().has("slug-a")).toBe(true);
   });

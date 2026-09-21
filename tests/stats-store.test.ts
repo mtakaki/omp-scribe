@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import {
+  appendBlueprintFailure,
   appendSavingsRun,
   formatSavingsDashboard,
   readStatsFile,
@@ -22,6 +23,7 @@ function makeEntry(overrides: Partial<SavingsRunLogEntry> = {}): SavingsRunLogEn
     brainOutputTokens: 50,
     writerInputTokens: 2000,
     writerOutputTokens: 300,
+    irOutputTokens: 42,
     writerCostUsd: 0,
     actualCostUsd: 0.001,
     baselineCostUsd: 0.010,
@@ -117,6 +119,14 @@ describe("appendSavingsRun", () => {
     expect(stats.totalEstimatedBaselineRuns).toBe(2);
   });
 
+  it("accumulates blueprint tokens, treating entries without the field as zero", async () => {
+    await appendSavingsRun(cwd, makeEntry({ irOutputTokens: 120 }));
+    const legacy = makeEntry();
+    delete legacy.irOutputTokens;
+    const stats = await appendSavingsRun(cwd, legacy);
+    expect(stats.totalIrOutputTokens).toBe(120);
+  });
+
   it("prepends new entries (most-recent-first)", async () => {
     const e1 = makeEntry({ slug: "first" });
     const e2 = makeEntry({ slug: "second" });
@@ -152,6 +162,45 @@ describe("appendSavingsRun", () => {
   });
 });
 
+describe("appendBlueprintFailure", () => {
+  it("increments both blueprintCallsTotal and blueprintCallsFailed atomically", async () => {
+    const stats = await appendBlueprintFailure(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+
+    const again = await appendBlueprintFailure(cwd);
+    expect(again.blueprintCallsTotal).toBe(2);
+    expect(again.blueprintCallsFailed).toBe(2);
+
+    // Confirm durable write: fresh readStatsFile sees same data
+    const reread = await readStatsFile(cwd);
+    expect(reread.blueprintCallsTotal).toBe(2);
+    expect(reread.blueprintCallsFailed).toBe(2);
+  });
+
+  it("does not increment blueprintCallsFailed on a successful run", async () => {
+    await appendSavingsRun(cwd, makeEntry());
+    const stats = await appendBlueprintFailure(cwd);
+    expect(stats.blueprintCallsTotal).toBe(2);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+
+  it("self-heals a pre-migration file missing blueprintCallsTotal/blueprintCallsFailed instead of crashing", async () => {
+    const dir = join(cwd, ".claude", "plans");
+    await mkdir(dir, { recursive: true });
+    // Pre-migration shape: valid version/runs/totalRuns, but no blueprint-call counters.
+    await Bun.write(
+      join(cwd, SAVINGS_STATS_RELATIVE_PATH),
+      JSON.stringify({ version: 1, totalRuns: 7, totalNetSavingsUsd: 1.23, runs: [] }),
+    );
+    const stats = await appendBlueprintFailure(cwd);
+    // Self-healed to a zeroed structure before incrementing — prior totals are not preserved.
+    expect(stats.totalRuns).toBe(0);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+});
+
 describe("formatSavingsDashboard", () => {
   it("renders a non-empty box for zero-run stats", () => {
     const empty: SavingsStatsFile = {
@@ -165,6 +214,8 @@ describe("formatSavingsDashboard", () => {
       totalBrainOutputTokens: 0,
       totalWriterInputTokens: 0,
       totalWriterOutputTokens: 0,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs: [],
     };
     const output = formatSavingsDashboard(empty);
@@ -175,6 +226,51 @@ describe("formatSavingsDashboard", () => {
     // No estimate marker or note when no baseline was estimated
     expect(output).not.toContain("~$");
     expect(output).not.toContain("not billed amounts");
+  });
+
+  it("renders 'n/a' for blueprint reliability when no blueprint calls were made", () => {
+    const empty: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 0,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 0,
+      totalBrainOutputTokens: 0,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 0,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(empty)
+      .split("\n")
+      .find(line => line.includes("Blueprint reliability"));
+    expect(row).toContain("n/a");
+  });
+
+  it("renders passed/total and a first-try percentage for blueprint reliability", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 3,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 0,
+      totalBrainOutputTokens: 0,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 0,
+      blueprintCallsTotal: 4,
+      blueprintCallsFailed: 1,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Blueprint reliability"));
+    expect(row).toContain("3/4");
+    expect(row).toContain("75%");
   });
 
   it("renders the doc-mode run count", () => {
@@ -191,6 +287,8 @@ describe("formatSavingsDashboard", () => {
       totalWriterOutputTokens: 0,
       totalPlanRuns: 1,
       totalDocRuns: 2,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs: [],
     };
     const output = formatSavingsDashboard(stats);
@@ -210,10 +308,57 @@ describe("formatSavingsDashboard", () => {
       totalBrainOutputTokens: 0,
       totalWriterInputTokens: 0,
       totalWriterOutputTokens: 0,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs: [],
     };
     const output = formatSavingsDashboard(stats);
     expect(output).toContain("no known per-token output rate in the catalog");
+  });
+
+  it("estimates brain output without scribe by trading the blueprint for the writer's document", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 1,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 3000,
+      totalIrOutputTokens: 400,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    expect(row).toContain("4,600");
+  });
+
+  it("falls back to brain + writer output when a pre-existing file lacks the blueprint total", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 1,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 3000,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
+      runs: [],
+    };
+    const row = formatSavingsDashboard(stats)
+      .split("\n")
+      .find(line => line.includes("Estimated brain tokens output without scribe"));
+    expect(row).toContain("5,000");
   });
 
   it("flags an @plan-role estimated baseline with a ~$ marker and note", () => {
@@ -229,6 +374,8 @@ describe("formatSavingsDashboard", () => {
       totalWriterInputTokens: 0,
       totalWriterOutputTokens: 2000,
       totalEstimatedBaselineRuns: 1,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs: [
         makeEntry({
           priced: false,
@@ -279,6 +426,8 @@ describe("formatSavingsDashboard", () => {
       totalBrainOutputTokens: 0,
       totalWriterInputTokens: 0,
       totalWriterOutputTokens: 0,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs,
     };
     const output = formatSavingsDashboard(stats);
@@ -300,6 +449,8 @@ describe("formatSavingsDashboard", () => {
       totalBrainOutputTokens: 50,
       totalWriterInputTokens: 2000,
       totalWriterOutputTokens: 300,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
       runs: [makeEntry()],
     };
     const output = formatSavingsDashboard(stats);
