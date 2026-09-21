@@ -28,7 +28,14 @@ import {
 import type { DocBlueprint, PlanBlueprint } from "./types";
 import { expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "./writer-session";
 import { computeCosts } from "./pricing";
-import { appendSavingsRun, estimateBlueprintTokens, formatSavingsDashboard, readStatsFile, type SavingsRunLogEntry } from "./stats-store";
+import {
+  appendBlueprintFailure,
+  appendSavingsRun,
+  estimateBlueprintTokens,
+  formatSavingsDashboard,
+  readStatsFile,
+  type SavingsRunLogEntry,
+} from "./stats-store";
 
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
@@ -294,6 +301,19 @@ export default function scribe(pi: ExtensionAPI): void {
         details: { slug: blueprint.slug, path: blueprint.path, markdownChars: result.markdown.length, writerModel: `${result.model.provider}/${result.model.id}` },
       };
     },
+  });
+
+  // ─── tool_result blueprint-failure tracking ──────────────────────────────
+  pi.on("tool_result", async (event, ctx) => {
+    if (!event.isError) return;
+    if (event.toolName !== BLUEPRINT_TOOL_NAME && event.toolName !== DOC_BLUEPRINT_TOOL_NAME) return;
+    try {
+      await appendBlueprintFailure(ctx.cwd);
+    } catch (error) {
+      pi.logger.warn(
+        `[scribe-extension] failed to persist blueprint failure stats: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   });
 
   // ─── before_agent_start ───────────────────────────────────────────────────

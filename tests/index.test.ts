@@ -747,6 +747,86 @@ describe("scribe: /savings command", () => {
   });
 });
 
+// ─── tool_result blueprint-failure tracking ───────────────────────────────────
+
+describe("scribe: tool_result blueprint-failure tracking", () => {
+  it("increments blueprintCallsTotal and blueprintCallsFailed when propose_plan_blueprint errors", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-fail-1",
+      toolName: BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Blueprint expansion failed: writer model did not resolve" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+
+  it("increments blueprintCallsTotal and blueprintCallsFailed when propose_doc_blueprint errors", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-fail-2",
+      toolName: DOC_BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Doc blueprint expansion failed" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+
+  it("ignores a successful blueprint tool_result", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-ok-1",
+      toolName: BLUEPRINT_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Blueprint accepted" }],
+      isError: false,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(0);
+    expect(stats.blueprintCallsFailed).toBe(0);
+  });
+
+  it("ignores tool_result events from unrelated tools", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-other-1",
+      toolName: "write",
+      input: {},
+      content: [{ type: "text", text: "some error" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(0);
+    expect(stats.blueprintCallsFailed).toBe(0);
+  });
+});
+
 // ─── Local model regression (cost=0 must not misreport as nonzero) ─────────────
 
 describe("scribe: local model cost regression", () => {
