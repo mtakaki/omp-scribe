@@ -719,8 +719,8 @@ describe("scribe: session_shutdown", () => {
     const fakeApi = createFakeExtensionApi();
     scribe(fakeApi.pi);
 
-    consumedWriteSwaps().set("tc-X", { sessionKey: "session-A", input: { path: "x", content: "y" } });
-    consumedWriteSwaps().set("tc-Y", { sessionKey: "session-B", input: { path: "x", content: "y" } });
+    consumedWriteSwaps().set("tc-X", { sessionKey: "session-A", input: { path: "x", content: "y" }, writerModel: "anthropic/claude-haiku-3-5", chars: 1 });
+    consumedWriteSwaps().set("tc-Y", { sessionKey: "session-B", input: { path: "x", content: "y" }, writerModel: "anthropic/claude-haiku-3-5", chars: 1 });
 
     const { ctx } = createFakeExtensionContext({ sessionId: "session-A" });
     fakeApi.emit("session_shutdown", {}, ctx);
@@ -749,7 +749,7 @@ describe("scribe: /savings command", () => {
 
 // ─── tool_result blueprint-failure tracking ───────────────────────────────────
 
-describe("scribe: tool_result blueprint-failure tracking", () => {
+describe("scribe: tool_result handling", () => {
   it("increments blueprintCallsTotal and blueprintCallsFailed when propose_plan_blueprint errors", async () => {
     const fakeApi = createFakeExtensionApi();
     scribe(fakeApi.pi);
@@ -824,6 +824,51 @@ describe("scribe: tool_result blueprint-failure tracking", () => {
     const stats = await readStatsFile(cwd);
     expect(stats.blueprintCallsTotal).toBe(0);
     expect(stats.blueprintCallsFailed).toBe(0);
+  });
+
+  it("annotates a successful write tool_result when a swap was consumed for its toolCallId", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    consumedWriteSwaps().set("tc-swap-1", {
+      sessionKey: "session-default",
+      input: { path: "local://swap-plan.md", content: "# Draft" },
+      writerModel: "anthropic/claude-haiku-3-5",
+      chars: 42,
+    });
+
+    const result = (await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-swap-1",
+      toolName: "write",
+      input: { path: "local://swap-plan.md", content: "pending" },
+      content: [{ type: "text", text: "Wrote local://swap-plan.md" }],
+      isError: false,
+    }, ctx)) as { content?: Array<{ type: string; text?: string }> } | undefined;
+
+    expect(result?.content).toBeDefined();
+    const lastPart = result!.content![result!.content!.length - 1];
+    expect(lastPart.text).toContain("42");
+    expect(lastPart.text).toContain("anthropic/claude-haiku-3-5");
+    expect(result!.content![0]).toEqual({ type: "text", text: "Wrote local://swap-plan.md" });
+  });
+
+  it("leaves a successful write tool_result untouched when no swap was consumed for its toolCallId", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    const result = await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-no-swap-1",
+      toolName: "write",
+      input: { path: "README.md", content: "# Hello" },
+      content: [{ type: "text", text: "Wrote README.md" }],
+      isError: false,
+    }, ctx);
+
+    expect(result).toBeUndefined();
   });
 });
 

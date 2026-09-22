@@ -48,6 +48,7 @@ Cost control is active for this plan turn. Do NOT compose the Markdown plan docu
    - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
    - \`preserve\` — array of things that must keep working; empty array when none.
    - \`doNot\` — array of explicit prohibitions; empty array when none.
+   - Exactly six elements per step — no extra notes, rationale, or constraints slots.
    Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
    Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
@@ -171,7 +172,7 @@ export default function scribe(pi: ExtensionAPI): void {
         .array(z.array(z.unknown()).min(6).max(6))
         .min(1)
         .describe(
-          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exact shape enforced when the blueprint tool runs.`,
+          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exactly six elements — no extra notes, rationale, or constraints slots. Exact shape enforced when the blueprint tool runs.`,
         ),
       verification: z
         .array(z.string())
@@ -303,17 +304,32 @@ export default function scribe(pi: ExtensionAPI): void {
     },
   });
 
-  // ─── tool_result blueprint-failure tracking ──────────────────────────────
+  // ─── tool_result blueprint-failure tracking & write-swap annotation ─────
   pi.on("tool_result", async (event, ctx) => {
-    if (!event.isError) return;
-    if (event.toolName !== BLUEPRINT_TOOL_NAME && event.toolName !== DOC_BLUEPRINT_TOOL_NAME) return;
-    try {
-      await appendBlueprintFailure(ctx.cwd);
-    } catch (error) {
-      pi.logger.warn(
-        `[scribe-extension] failed to persist blueprint failure stats: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    if (event.isError) {
+      if (event.toolName !== BLUEPRINT_TOOL_NAME && event.toolName !== DOC_BLUEPRINT_TOOL_NAME) return;
+      try {
+        await appendBlueprintFailure(ctx.cwd);
+      } catch (error) {
+        pi.logger.warn(
+          `[scribe-extension] failed to persist blueprint failure stats: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return;
     }
+
+    if (event.toolName !== "write") return;
+    const swap = consumedWriteSwaps().get(event.toolCallId);
+    if (!swap) return;
+    return {
+      content: [
+        ...event.content,
+        {
+          type: "text",
+          text: `\n[scribe] The ${swap.chars}-character draft from ${swap.writerModel} replaced the content you submitted; verify it matches your intent before proceeding.`,
+        },
+      ],
+    };
   });
 
   // ─── before_agent_start ───────────────────────────────────────────────────
@@ -434,7 +450,7 @@ export default function scribe(pi: ExtensionAPI): void {
         brainCostUsd = 0;
         brainOutputRatePerMillionUsd = 0;
         const swappedInput = { ...input, content: entry.markdown };
-        swapCache.set(event.toolCallId, { sessionKey: sessionKey(ctx), input: swappedInput as Record<string, unknown> });
+        swapCache.set(event.toolCallId, { sessionKey: sessionKey(ctx), input: swappedInput as Record<string, unknown>, writerModel, chars: entry.markdown.length });
         showStatus(ctx, baseStatus(ctx));
         return { input: swappedInput };
       }
@@ -511,7 +527,7 @@ export default function scribe(pi: ExtensionAPI): void {
       brainCostUsd = 0;
       brainOutputRatePerMillionUsd = 0;
       const swappedInput = { ...input, content: docEntry.markdown };
-      swapCache.set(event.toolCallId, { sessionKey: sessionKey(ctx), input: swappedInput as Record<string, unknown> });
+      swapCache.set(event.toolCallId, { sessionKey: sessionKey(ctx), input: swappedInput as Record<string, unknown>, writerModel, chars: docEntry.markdown.length });
       showStatus(ctx, baseStatus(ctx));
       return { input: swappedInput };
     }

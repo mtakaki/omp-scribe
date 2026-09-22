@@ -462,7 +462,7 @@ describe("consumedWriteSwaps", () => {
   });
 
   it("mutations are visible across calls", () => {
-    consumedWriteSwaps().set("call-id-1", { sessionKey: "s", input: { path: "x", content: "y" } });
+    consumedWriteSwaps().set("call-id-1", { sessionKey: "s", input: { path: "x", content: "y" }, writerModel: "anthropic/claude-haiku-3-5", chars: 1 });
     expect(consumedWriteSwaps().has("call-id-1")).toBe(true);
   });
 });

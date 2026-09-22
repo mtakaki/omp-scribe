@@ -279,6 +279,10 @@ export interface ConsumedWriteSwap {
   sessionKey: string;
   /** The already-computed swapped input (with expanded Markdown), ready to return. */
   input: Record<string, unknown>;
+  /** `provider/id` of the writer model that produced the swapped-in draft. */
+  writerModel: string;
+  /** Character length of the swapped-in Markdown draft. */
+  chars: number;
 }
 
 const CONSUMED_SWAP_STORE_KEY = "scribe-extension.consumedWriteSwapStore";

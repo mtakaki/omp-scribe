@@ -78,6 +78,59 @@ describe("expandBlueprintToMarkdown", () => {
     expect(result.markdown).toBe("Hello World");
   });
 
+  it("recovers markdown from a whole message_end.message.content when no text_delta events fire", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript([
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "# Recovered\n\nBody." }],
+          usage: { input: 10, output: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          provider: "anthropic",
+          model: "claude-haiku-3-5",
+        },
+      },
+      { type: "agent_end", isTerminal: true },
+    ]);
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+    expect(result.markdown).toBe("# Recovered\n\nBody.");
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("prefers the message_end content text over streamed deltas instead of concatenating both", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript([
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "   \n  " } },
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "# Same\n\nText." }],
+          usage: { input: 10, output: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          provider: "anthropic",
+          model: "claude-haiku-3-5",
+        },
+      },
+      { type: "agent_end", isTerminal: true },
+    ]);
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+    expect(result.markdown).toBe("# Same\n\nText.");
+    expect(sessionCount()).toBe(1);
+  });
+
   it("returns error when writer model spec does not resolve and @smol also fails", async () => {
     const fakeApi = createFakeExtensionApi();
     const { ctx } = createFakeExtensionContext({

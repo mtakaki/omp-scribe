@@ -64,6 +64,18 @@ export type ExpandResult =
   | { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number }
   | { error: string };
 
+/** Joins the `text` parts of a `message_end` assistant message's content
+ *  array, in emission order.  Some providers deliver the writer's completion
+ *  only as a whole `message_end.message.content` and never stream
+ *  `text_delta` chunks; this recovers the full response in that case. */
+function assistantMessageText(content: readonly { type: string; text?: string }[] | undefined): string {
+  if (!content) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+    .map(part => part.text)
+    .join("");
+}
+
 /** Shared nested-session execution helper.  Creates a tools-free session on
  *  `writerModel`, sends `promptText` verbatim as the user message, accumulates
  *  the streamed Markdown response, and disposes the session in a finally block.
@@ -98,18 +110,20 @@ async function runWriterExpansion(
     session = created.session;
     const activeSession = session;
 
-    let markdown = "";
+    let streamed = "";
+    let messageText = "";
     let writerUsage = { input: 0, output: 0 };
     let writerCostUsd = 0;
     await new Promise<void>((resolve, reject) => {
       const unsubscribe = activeSession.subscribe(evt => {
         if (evt.type === "message_update" && evt.assistantMessageEvent.type === "text_delta") {
-          markdown += evt.assistantMessageEvent.delta;
+          streamed += evt.assistantMessageEvent.delta;
           return;
         }
         if (evt.type === "message_end" && evt.message.role === "assistant") {
           writerUsage = { input: writerUsage.input + evt.message.usage.input, output: writerUsage.output + evt.message.usage.output };
           writerCostUsd += (evt.message.usage.cost?.total ?? 0);
+          messageText = assistantMessageText(evt.message.content) || messageText;
           return;
         }
         if (evt.type === "agent_end" && evt.isTerminal !== false) {
@@ -123,7 +137,7 @@ async function runWriterExpansion(
       });
     });
 
-    markdown = markdown.trim();
+    const markdown = (messageText || streamed).trim();
     if (!markdown) return { error: "Writer model returned an empty response." };
     return { markdown, model: { provider: writerModel.provider, id: writerModel.id }, usage: writerUsage, costUsd: writerCostUsd };
   } catch (error) {
