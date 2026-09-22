@@ -16,7 +16,7 @@
 
 export type FakeSessionEvent =
   | { type: "message_update"; assistantMessageEvent: { type: "text_delta"; delta: string } }
-  | { type: "message_end"; message: { role: string; usage: { input: number; output: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } }; provider: string; model: string } }
+  | { type: "message_end"; message: { role: string; content?: Array<{ type: string; text?: string }>; usage: { input: number; output: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } }; provider: string; model: string } }
   | { type: "agent_end"; isTerminal?: boolean };
 
 export interface FakeAgentSession {
