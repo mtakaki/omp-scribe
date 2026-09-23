@@ -1,0 +1,27 @@
+{
+  "name": "mtakaki",
+  "owner": {
+    "name": "mtakaki"
+  },
+  "plugins": [
+    {
+      "name": "omp-scribe",
+      "description": "Reduce oh-my-pi planning costs by separating reasoning from document generation.",
+      "source": {
+        "source": "github",
+        "repo": "mtakaki/omp-scribe",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/mtakaki/omp-scribe",
+      "repository": "https://github.com/mtakaki/omp-scribe",
+      "license": "Apache-2.0",
+      "category": "productivity",
+      "keywords": [
+        "oh-my-pi",
+        "omp",
+        "token-cost",
+        "planning"
+      ]
+    }
+  ]
+}
