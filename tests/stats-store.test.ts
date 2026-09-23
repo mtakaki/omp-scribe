@@ -24,6 +24,7 @@ function makeEntry(overrides: Partial<SavingsRunLogEntry> = {}): SavingsRunLogEn
     writerInputTokens: 2000,
     writerOutputTokens: 300,
     irOutputTokens: 42,
+    docOutputTokens: 400,
     writerCostUsd: 0,
     actualCostUsd: 0.001,
     baselineCostUsd: 0.010,
@@ -125,6 +126,47 @@ describe("appendSavingsRun", () => {
     delete legacy.irOutputTokens;
     const stats = await appendSavingsRun(cwd, legacy);
     expect(stats.totalIrOutputTokens).toBe(120);
+  });
+
+  it("accumulates returned-document tokens, falling back to writer output for legacy entries", async () => {
+    // A pre-existing ledger has no totalDocOutputTokens: the first append must seed
+    // it from the logged runs' own measures, then add the new entry's measure.
+    const seeded = await appendSavingsRun(cwd, makeEntry({ docOutputTokens: 400, writerOutputTokens: 300 }));
+    expect(seeded.totalDocOutputTokens).toBe(400);
+
+    const legacy = makeEntry({ writerOutputTokens: 250 });
+    delete legacy.docOutputTokens;
+    const stats = await appendSavingsRun(cwd, legacy);
+    // 400 (first run) + 250 (legacy run measures its raw writer output)
+    expect(stats.totalDocOutputTokens).toBe(650);
+  });
+
+  it("seeds the document total from an existing run log that predates the field", async () => {
+    const dir = join(cwd, ".claude", "plans");
+    await mkdir(dir, { recursive: true });
+    // Pre-change shape: a valid file whose runs carry no per-run docOutputTokens.
+    await Bun.write(
+      join(cwd, SAVINGS_STATS_RELATIVE_PATH),
+      JSON.stringify({
+        version: 1,
+        totalRuns: 1,
+        totalUnpricedRuns: 0,
+        totalActualCostUsd: 0,
+        totalBaselineCostUsd: 0,
+        totalNetSavingsUsd: 0,
+        totalBrainInputTokens: 0,
+        totalBrainOutputTokens: 0,
+        totalWriterInputTokens: 0,
+        totalWriterOutputTokens: 300,
+        blueprintCallsTotal: 0,
+        blueprintCallsFailed: 0,
+        runs: [makeEntry({ docOutputTokens: undefined, writerOutputTokens: 300 })],
+      }),
+    );
+
+    const stats = await appendSavingsRun(cwd, makeEntry({ docOutputTokens: 400 }));
+    // 300 seeded from the legacy run log + 400 from the new entry
+    expect(stats.totalDocOutputTokens).toBe(700);
   });
 
   it("prepends new entries (most-recent-first)", async () => {
@@ -316,7 +358,7 @@ describe("formatSavingsDashboard", () => {
     expect(output).toContain("no known per-token output rate in the catalog");
   });
 
-  it("estimates brain output without scribe by trading the blueprint for the writer's document", () => {
+  it("estimates brain output without scribe from the returned document, not the writer's raw output", () => {
     const stats: SavingsStatsFile = {
       version: 1,
       totalRuns: 1,
@@ -327,19 +369,50 @@ describe("formatSavingsDashboard", () => {
       totalBrainInputTokens: 1000,
       totalBrainOutputTokens: 2000,
       totalWriterInputTokens: 0,
+      // The writer's raw output (3,000) is deliberately larger than the returned
+      // document (600): the estimate must follow the document, not the raw usage.
       totalWriterOutputTokens: 3000,
+      totalIrOutputTokens: 400,
+      totalDocOutputTokens: 600,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
+      runs: [],
+    };
+    const lines = formatSavingsDashboard(stats).split("\n");
+    const withoutScribe = lines.find(line => line.includes("Estimated brain tokens output without scribe"));
+    // 2,000 brain output − 400 blueprint + 600 returned document
+    expect(withoutScribe).toContain("2,200");
+    expect(lines.find(line => line.includes("Blueprint tokens (brain, est.)"))).toContain("400");
+    expect(lines.find(line => line.includes("Delegated doc tokens (est.)"))).toContain("600");
+  });
+
+  it("seeds the delegated doc total from the run log when a pre-existing file lacks it", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 2,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 600,
       totalIrOutputTokens: 400,
       blueprintCallsTotal: 0,
       blueprintCallsFailed: 0,
-      runs: [],
+      runs: [
+        makeEntry({ docOutputTokens: 400 }), // measured the new way: 400
+        makeEntry({ docOutputTokens: undefined, writerOutputTokens: 300 }), // legacy: falls back to 300
+      ],
     };
-    const row = formatSavingsDashboard(stats)
-      .split("\n")
-      .find(line => line.includes("Estimated brain tokens output without scribe"));
-    expect(row).toContain("4,600");
+    const lines = formatSavingsDashboard(stats).split("\n");
+    expect(lines.find(line => line.includes("Delegated doc tokens (est.)"))).toContain("700");
+    // 2,000 brain output − 400 blueprint + (400 + 300) seeded document tokens
+    expect(lines.find(line => line.includes("Estimated brain tokens output without scribe"))).toContain("2,300");
   });
 
-  it("falls back to brain + writer output when a pre-existing file lacks the blueprint total", () => {
+  it("reads zero delegated doc tokens when the file lacks both the total and any run log", () => {
     const stats: SavingsStatsFile = {
       version: 1,
       totalRuns: 1,
@@ -355,10 +428,32 @@ describe("formatSavingsDashboard", () => {
       blueprintCallsFailed: 0,
       runs: [],
     };
-    const row = formatSavingsDashboard(stats)
-      .split("\n")
-      .find(line => line.includes("Estimated brain tokens output without scribe"));
-    expect(row).toContain("5,000");
+    const lines = formatSavingsDashboard(stats).split("\n");
+    expect(lines.find(line => line.includes("Blueprint tokens (brain, est.)"))).toContain("0");
+    expect(lines.find(line => line.includes("Delegated doc tokens (est.)"))).toContain("0");
+    // Nothing is credited back, so the estimate is the brain output alone.
+    expect(lines.find(line => line.includes("Estimated brain tokens output without scribe"))).toContain("2,000");
+  });
+
+  it("explains the writer-usage vs returned-document difference in a footnote", () => {
+    const stats: SavingsStatsFile = {
+      version: 1,
+      totalRuns: 1,
+      totalUnpricedRuns: 0,
+      totalActualCostUsd: 0,
+      totalBaselineCostUsd: 0,
+      totalNetSavingsUsd: 0,
+      totalBrainInputTokens: 1000,
+      totalBrainOutputTokens: 2000,
+      totalWriterInputTokens: 0,
+      totalWriterOutputTokens: 3000,
+      blueprintCallsTotal: 0,
+      blueprintCallsFailed: 0,
+      runs: [],
+    };
+    const output = formatSavingsDashboard(stats);
+    expect(output).toContain('"Writer tokens output" is the writer model\'s raw usage');
+    expect(output).toContain("without-scribe row uses that figure");
   });
 
   it("flags an @plan-role estimated baseline with a ~$ marker and note", () => {

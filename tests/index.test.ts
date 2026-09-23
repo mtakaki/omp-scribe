@@ -335,12 +335,19 @@ describe("scribe: message_end", () => {
     const blueprintTokens = Math.round(JSON.stringify(blueprint).length / 4);
     expect(stats.totalIrOutputTokens).toBe(blueprintTokens);
 
-    // Without scribe the brain would have emitted the writer's document instead of
+    // The returned document is measured directly, so its estimate differs from the
+    // writer session's raw output (which the fake reports as 40 regardless of text).
+    const documentTokens = Math.round("# Plan\n\nBody.".length / 4);
+    expect(stats.runs[0]!.docOutputTokens).toBe(documentTokens);
+    expect(stats.runs[0]!.writerOutputTokens).toBe(40);
+    expect(stats.totalDocOutputTokens).toBe(documentTokens);
+
+    // Without scribe the brain would have emitted the returned document instead of
     // the blueprint, so the dashboard trades one for the other.
     const row = formatSavingsDashboard(stats)
       .split("\n")
       .find(line => line.includes("Estimated brain tokens output without scribe"));
-    const withoutScribe = stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - blueprintTokens;
+    const withoutScribe = stats.totalBrainOutputTokens - blueprintTokens + stats.totalDocOutputTokens!;
     expect(row).toContain(withoutScribe.toLocaleString("en-US"));
   });
 
@@ -928,7 +935,9 @@ describe("scribe: local model cost regression", () => {
     // reference model: the baseline must fall back to those rates instead of
     // collapsing total net savings to $0.00.
     const { fakeSdk, setScript } = createFakeSdk();
-    setScript(successScript("# Local Model Plan\n\nExpanded content.", 0));
+    // Long enough that the returned document outweighs the blueprint it replaced.
+    const markdown = "# Local Model Plan\n\n" + "Expanded content. ".repeat(20);
+    setScript(successScript(markdown, 0));
 
     const fakeApi = createFakeExtensionApi();
     const { pi } = fakeApi;
@@ -950,20 +959,16 @@ describe("scribe: local model cost regression", () => {
     await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
     await fakeApi.emit("message_end", makeMessageEndEvent("assistant", { input: 1000, output: 50 }), ctx);
 
-    await fakeApi.callTool(
-      BLUEPRINT_TOOL_NAME,
-      "bp-ref",
-      {
-        slug: "local-model-plan",
-        title: "Local Model Plan",
-        context: "Context.",
-        files: EXAMPLE_FILES,
-        steps: EXAMPLE_STEPS,
-        verification: ["v"],
-        assumptions: [],
-      },
-      ctx,
-    );
+    const blueprint = {
+      slug: "local-model-plan",
+      title: "Local Model Plan",
+      context: "Context.",
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
+      verification: ["v"],
+      assumptions: [],
+    };
+    await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "bp-ref", blueprint, ctx);
 
     await fakeApi.emit("tool_call", makeWriteEvent("local://local-model-plan-plan.md", "pending", "tc-ref-1"), ctx);
 
@@ -974,8 +979,14 @@ describe("scribe: local model cost regression", () => {
     expect(run.actualCostUsd).toBe(0);
     expect(run.priced).toBe(false);
     expect(run.baselineIsEstimate).toBe(true);
-    // brainInputTokens (1000) * ref input rate (3) + writerOutputTokens (40) * ref output rate (15), per million.
-    const expectedBaseline = (1000 * 3 + 40 * 15) / 1e6;
+    // The ledger records the returned document's estimate, not the writer's raw output.
+    const documentTokens = Math.round(markdown.length / 4);
+    const blueprintTokens = Math.round(JSON.stringify(blueprint).length / 4);
+    expect(run.docOutputTokens).toBe(documentTokens);
+    expect(run.irOutputTokens).toBe(blueprintTokens);
+    // brainInputTokens (1000) * ref input rate (3) + (document − blueprint) tokens
+    // at the ref output rate (15), per million.
+    const expectedBaseline = (1000 * 3 + (documentTokens - blueprintTokens) * 15) / 1e6;
     expect(run.baselineCostUsd).toBeCloseTo(expectedBaseline, 8);
     expect(run.netSavingsUsd).toBeCloseTo(run.baselineCostUsd, 8);
     expect(run.netSavingsUsd).toBeGreaterThan(0);
@@ -1215,6 +1226,10 @@ describe("scribe: doc-mode tool_call write swap", () => {
     expect(stats.runs[0]!.slug).toBe("arch-doc");
     // Doc blueprints are billed the same way: the outline JSON is scribe-specific output.
     expect(stats.totalIrOutputTokens).toBe(Math.round(JSON.stringify(blueprint).length / 4));
+    // The returned document is measured directly, not taken from the writer's raw usage.
+    const documentTokens = Math.round("# Arch Doc\n\nBody.".length / 4);
+    expect(stats.runs[0]!.docOutputTokens).toBe(documentTokens);
+    expect(stats.totalDocOutputTokens).toBe(documentTokens);
   });
 
   it("duplicate toolCallId for doc write returns cached swap (idempotent delivery)", async () => {

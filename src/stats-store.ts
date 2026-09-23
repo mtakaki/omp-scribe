@@ -21,6 +21,12 @@ export interface SavingsRunLogEntry {
   /** Estimated tokens the brain spent emitting the compact blueprint JSON instead
    *  of the document body; absent in legacy entries (treat as 0). */
   irOutputTokens?: number;
+  /** Estimated tokens of the Markdown document the writer returned for this run,
+   *  at ~4 characters per token (see {@link estimateTextTokens}).  Measures the
+   *  returned document rather than the writer's raw `usage.output`, which is
+   *  inflated by generation that never reached the returned Markdown.  Absent in
+   *  legacy entries, which fall back to `writerOutputTokens`. */
+  docOutputTokens?: number;
   /** Actual cost in USD charged by the writer model alone for this run
    *  (sourced from ExpandResult.costUsd); zero for local/free writer models. */
   writerCostUsd: number;
@@ -68,6 +74,11 @@ export interface SavingsStatsFile {
   /** Cumulative blueprint tokens the brain emitted instead of the document
    *  body; optional for backward compat with earlier files. */
   totalIrOutputTokens?: number;
+  /** Cumulative estimated tokens of the returned Markdown documents across all
+   *  runs; optional for backward compat with earlier files, whose entries carry
+   *  no per-run `docOutputTokens` and are measured by `writerOutputTokens`
+   *  instead. */
+  totalDocOutputTokens?: number;
   /** Total count of blueprint tool calls: incremented once per successful run
    *  in `appendSavingsRun` and once per failed call in `appendBlueprintFailure`.
    *  Required (not optional) — a pre-migration file missing this field fails
@@ -102,6 +113,7 @@ function emptyStatsFile(): SavingsStatsFile {
     totalPaidWriterNetSavingsUsd: 0,
     totalEstimatedBaselineRuns: 0,
     totalIrOutputTokens: 0,
+    totalDocOutputTokens: 0,
     blueprintCallsTotal: 0,
     blueprintCallsFailed: 0,
     runs: [],
@@ -122,6 +134,13 @@ function isSavingsStatsFile(value: unknown): value is SavingsStatsFile {
 
 function statsFilePath(cwd: string): string {
   return join(cwd, SAVINGS_STATS_RELATIVE_PATH);
+}
+
+/** Sum the returned-document token estimate over `runs`, falling back to
+ *  `writerOutputTokens` for legacy entries that predate `docOutputTokens`.
+ *  Used to seed `totalDocOutputTokens` when a pre-existing ledger lacks it. */
+function docTokensFromRuns(runs: SavingsRunLogEntry[]): number {
+  return runs.reduce((sum, run) => sum + (run.docOutputTokens ?? run.writerOutputTokens), 0);
 }
 
 /** Read the persisted stats file.  Returns a clean zeroed structure on ENOENT,
@@ -165,6 +184,9 @@ export async function appendSavingsRun(cwd: string, entry: SavingsRunLogEntry): 
     totalPaidWriterNetSavingsUsd: (current.totalPaidWriterNetSavingsUsd ?? 0) + (isFreeWriter ? 0 : entry.netSavingsUsd),
     totalEstimatedBaselineRuns: (current.totalEstimatedBaselineRuns ?? 0) + (entry.baselineIsEstimate ? 1 : 0),
     totalIrOutputTokens: (current.totalIrOutputTokens ?? 0) + (entry.irOutputTokens ?? 0),
+    totalDocOutputTokens:
+      (current.totalDocOutputTokens ?? docTokensFromRuns(current.runs)) +
+      (entry.docOutputTokens ?? entry.writerOutputTokens),
     blueprintCallsTotal: current.blueprintCallsTotal + 1,
     blueprintCallsFailed: current.blueprintCallsFailed,
     runs: [entry, ...current.runs].slice(0, 200),
@@ -222,12 +244,19 @@ function dataRow(label: string, value: string): string {
   return `║${content}║`;
 }
 
+/** Estimated token count of `text` at ~4 characters per token.  The package has
+ *  no runtime tokenizer dependency, so this is the shared measure for both the
+ *  blueprint JSON the brain emits and the Markdown document the writer returns. */
+export function estimateTextTokens(text: string): number {
+  return Math.round(text.length / 4);
+}
+
 /** Estimated token count of a compact blueprint JSON payload, at ~4 characters
  *  per token.  Subtracted from the brain's output when reporting how much it
  *  would have emitted had it authored the document body itself, since the
  *  blueprint exists only because of scribe. */
 export function estimateBlueprintTokens(blueprint: unknown): number {
-  return Math.round(JSON.stringify(blueprint).length / 4);
+  return estimateTextTokens(JSON.stringify(blueprint));
 }
 
 /** Render a full ASCII dashboard of `stats` as a multi-line string.
@@ -240,10 +269,15 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
   const estimatedRuns = stats.totalEstimatedBaselineRuns ?? 0;
   /** Aggregate savings carry a `~` while any contributing baseline is an estimate. */
   const estimateMark = estimatedRuns > 0 ? "~" : "";
+  /** Blueprint tokens the brain emitted in place of the document body. */
+  const blueprintOutputTokens = stats.totalIrOutputTokens ?? 0;
+  /** The returned document's estimated tokens; legacy ledgers without the total
+   *  are seeded from the recent-run log, falling back to `writerOutputTokens`. */
+  const documentOutputTokens = stats.totalDocOutputTokens ?? docTokensFromRuns(stats.runs);
   /** Without scribe the brain emits the document body in place of the blueprint,
-   *  so re-add what the writer produced and drop what the blueprint cost. */
+   *  so re-add the returned document's tokens and drop what the blueprint cost. */
   const estimatedBrainOutputTokens =
-    stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - (stats.totalIrOutputTokens ?? 0);
+    stats.totalBrainOutputTokens - blueprintOutputTokens + documentOutputTokens;
   const usd = (n: number) => `$${n.toFixed(4)}`;
   const num = (n: number) => n.toLocaleString("en-US");
   const blueprintCallsTotal = stats.blueprintCallsTotal ?? 0;
@@ -271,6 +305,8 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     dataRow("Brain tokens output", num(stats.totalBrainOutputTokens)),
     dataRow("Writer tokens input", num(stats.totalWriterInputTokens)),
     dataRow("Writer tokens output", num(stats.totalWriterOutputTokens)),
+    dataRow("Blueprint tokens (brain, est.)", num(blueprintOutputTokens)),
+    dataRow("Delegated doc tokens (est.)", num(documentOutputTokens)),
     dataRow("Estimated brain tokens output without scribe", num(estimatedBrainOutputTokens)),
     SEP,
     dataRow("Free/local writer runs", num(stats.totalFreeWriterRuns ?? 0)),
@@ -306,6 +342,12 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
         `@plan-role reference model's rates; savings marked "~$" are estimates, not billed amounts.`,
     );
   }
+
+  lines.push(
+    `ℹ  "Writer tokens output" is the writer model's raw usage, which includes generation that never reached the ` +
+      `returned document; "Delegated doc tokens (est.)" measures the Markdown actually returned (~4 chars/token), and the ` +
+      `without-scribe row uses that figure.`,
+  );
 
   return lines.join("\n");
 }

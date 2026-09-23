@@ -72,6 +72,8 @@ Example output (recent-run slugs anonymized; every other figure is real accumula
 ║  Brain tokens output                                  729,819  ║
 ║  Writer tokens input                                  111,779  ║
 ║  Writer tokens output                                 116,125  ║
+║  Blueprint tokens (brain, est.)                             0  ║
+║  Delegated doc tokens (est.)                          116,125  ║
 ║  Estimated brain tokens output without scribe         845,944  ║
 ╟────────────────────────────────────────────────────────────────╢
 ║  Free/local writer runs                                    16  ║
@@ -88,6 +90,7 @@ Example output (recent-run slugs anonymized; every other figure is real accumula
 ║    2026-09-20  optimize-query-cache                   $0.0345  ║
 ╚────────────────────────────────────────────────────────────────╝
 ⚠  4 run(s) used a brain model with no known per-token output rate in the catalog (e.g. a local/custom model); their baseline (and net savings) is recorded as $0.00 unless an @plan-role estimate replaced it — real baseline may be higher.
+ℹ  "Writer tokens output" is the writer model's raw usage, which includes generation that never reached the returned document; "Delegated doc tokens (est.)" measures the Markdown actually returned (~4 chars/token), and the without-scribe row uses that figure.
 ```
 
 The `/savings` command renders an ASCII dashboard summarizing the cumulative data in `.claude/plans/savings_stats.json`. Rows appear in this exact top-to-bottom order (labels below match the literal strings in `formatSavingsDashboard`, `src/stats-store.ts`):
@@ -105,8 +108,10 @@ The `/savings` command renders an ASCII dashboard summarizing the cumulative dat
 - `Brain tokens input` — cumulative input tokens consumed by the expensive (brain) model across all runs (`totalBrainInputTokens`).
 - `Brain tokens output` — cumulative output tokens produced by the brain model (`totalBrainOutputTokens`).
 - `Writer tokens input` — cumulative input tokens consumed by the cheap writer model that expands blueprints into Markdown (`totalWriterInputTokens`).
-- `Writer tokens output` — cumulative output tokens produced by the writer model (`totalWriterOutputTokens`).
-- `Estimated brain tokens output without scribe` — what the brain would have emitted had it authored every document body itself: `totalBrainOutputTokens` + `totalWriterOutputTokens` − `totalIrOutputTokens`, the blueprint JSON the brain emits only because of scribe (estimated at roughly four characters per token). Files predating blueprint-token tracking lack `totalIrOutputTokens` and read as zero, so the estimate then subtracts nothing and is an upper bound.
+- `Writer tokens output` — cumulative output tokens reported by the writer model's session (`totalWriterOutputTokens`). This is raw generation, which can exceed what the returned documents actually contain.
+- `Blueprint tokens (brain, est.)` — cumulative estimated tokens the brain spent emitting the compact blueprint JSON in place of the document body (`totalIrOutputTokens`), at roughly four characters per token. Legacy files predating blueprint-token tracking lack the total and read as zero.
+- `Delegated doc tokens (est.)` — cumulative estimated tokens of the Markdown documents the writer actually returned (`totalDocOutputTokens`), at roughly four characters per token. A legacy ledger lacking the total seeds it from its own run log, using each entry's `docOutputTokens` when present and otherwise that entry's `writerOutputTokens`.
+- `Estimated brain tokens output without scribe` — what the brain would have emitted had it authored every document body itself: `totalBrainOutputTokens` − `totalIrOutputTokens` + `totalDocOutputTokens`. The blueprint JSON exists only because of scribe, so it is credited back out, and the returned document's own measure (`Delegated doc tokens (est.)`) is added in rather than the writer's raw output. A legacy ledger lacking both totals treats the blueprint as zero and seeds the document total from its run log, so a ledger whose retained runs still cover every run keeps the figure it reported before this change.
 
 **Writer-cost breakdown**
 - `Free/local writer runs` — count of runs where the writer model was free/local, i.e. `writerCostUsd === 0` for that run (`totalFreeWriterRuns`).
@@ -122,6 +127,7 @@ The `/savings` command renders an ASCII dashboard summarizing the cumulative dat
 **Footnotes** (each shown only when applicable)
 - `⚠  <n> run(s) used a brain model with no known per-token output rate in the catalog...` — appears when `totalUnpricedRuns > 0`; warns that those runs' baseline (and therefore savings) defaulted to $0.00 unless an `@plan`-role estimate replaced it.
 - `ℹ  <n> run(s) had no catalog rate for the live brain model...` — appears when `totalEstimatedBaselineRuns > 0`; clarifies that the `~$`-marked figures above are `@plan`-role-derived estimates, not billed amounts.
+- `ℹ  "Writer tokens output" is the writer model's raw usage...` — always shown; distinguishes the writer session's raw generation from `Delegated doc tokens (est.)`, the measure of the Markdown actually returned, and notes that the without-scribe row uses the latter.
 
 ## How does it work
 

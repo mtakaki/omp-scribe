@@ -32,6 +32,7 @@ import {
   appendBlueprintFailure,
   appendSavingsRun,
   estimateBlueprintTokens,
+  estimateTextTokens,
   formatSavingsDashboard,
   readStatsFile,
   type SavingsRunLogEntry,
@@ -411,11 +412,14 @@ export default function scribe(pi: ExtensionAPI): void {
             : "unknown/unknown");
         const writerModel = `${entry.writerModel.provider}/${entry.writerModel.id}`;
         const referenceRates = planRoleReferenceRates(ctx);
+        /** Measured on the returned document, not the writer's raw output. */
+        const docOutputTokens = estimateTextTokens(entry.markdown);
         const costs = computeCosts({
           brainActualTotalCostUsd: brainCostUsd,
           writerActualCostUsd: entry.writerCostUsd,
           brainOutputRatePerMillionUsd,
-          writerOutputTokens: entry.writerUsage.output,
+          documentOutputTokens: docOutputTokens,
+          blueprintOutputTokens: entry.irOutputTokens,
           brainInputTokens: brainUsage.input,
           referenceInputRatePerMillionUsd: referenceRates.input,
           referenceOutputRatePerMillionUsd: referenceRates.output,
@@ -437,6 +441,7 @@ export default function scribe(pi: ExtensionAPI): void {
           priced: costs.priced,
           baselineIsEstimate: costs.baselineIsEstimate,
           irOutputTokens: entry.irOutputTokens,
+          docOutputTokens,
         };
         try {
           await appendSavingsRun(ctx.cwd, runEntry);
@@ -488,11 +493,14 @@ export default function scribe(pi: ExtensionAPI): void {
           : "unknown/unknown");
       const writerModel = `${docEntry.writerModel.provider}/${docEntry.writerModel.id}`;
       const referenceRates = planRoleReferenceRates(ctx);
+      /** Measured on the returned document, not the writer's raw output. */
+      const docOutputTokens = estimateTextTokens(docEntry.markdown);
       const costs = computeCosts({
         brainActualTotalCostUsd: brainCostUsd,
         writerActualCostUsd: docEntry.writerCostUsd,
         brainOutputRatePerMillionUsd,
-        writerOutputTokens: docEntry.writerUsage.output,
+        documentOutputTokens: docOutputTokens,
+        blueprintOutputTokens: docEntry.irOutputTokens,
         brainInputTokens: brainUsage.input,
         referenceInputRatePerMillionUsd: referenceRates.input,
         referenceOutputRatePerMillionUsd: referenceRates.output,
@@ -514,6 +522,7 @@ export default function scribe(pi: ExtensionAPI): void {
         priced: costs.priced,
         baselineIsEstimate: costs.baselineIsEstimate,
         irOutputTokens: docEntry.irOutputTokens,
+        docOutputTokens,
       };
       try {
         await appendSavingsRun(ctx.cwd, runEntry);

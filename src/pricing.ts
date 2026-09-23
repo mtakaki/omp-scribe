@@ -9,11 +9,18 @@ export interface CostComputationInput {
    *  `Model.cost.output` field.  Zero when the model has no known catalog rate
    *  (e.g. a local/custom model), in which case `priced` will be `false`. */
   brainOutputRatePerMillionUsd: number;
-  /** Actual token count the writer model spent emitting the final Markdown
-   *  (sourced from `usage.output` in the nested writer session).  The baseline
-   *  prices these tokens at the brain model's output rate, since the brain model
-   *  would have had to output them itself. */
-  writerOutputTokens: number;
+  /** Estimated token count of the Markdown document the writer returned
+   *  (~4 characters per token, from `estimateTextTokens`), not the writer's raw
+   *  `usage.output` — the latter is inflated by generation that never reached the
+   *  returned document, which overstated both the token estimate and this baseline.
+   *  The baseline prices these tokens at the brain model's output rate, since the
+   *  brain model would have had to emit them itself. */
+  documentOutputTokens: number;
+  /** Estimated token count of the compact blueprint JSON the brain emitted in
+   *  place of the document body.  Credited back out of the baseline: without
+   *  scribe the brain would have written neither the blueprint nor the document
+   *  it replaced. */
+  blueprintOutputTokens: number;
   /** Total input token count the brain model spent this turn (sourced from
    *  `usage.input`).  Consulted only by the fallback baseline estimate, which
    *  prices these tokens at the reference model's input rate. */
@@ -54,21 +61,22 @@ export interface CostComputationResult {
  *
  *  The baseline simulates what the brain model would have charged had it authored
  *  the expanded Markdown itself: the brain's own actual turn cost, plus the
- *  writer's real output token count priced at the brain model's per-million
- *  output rate.
+ *  returned document's estimated token count priced at the brain model's
+ *  per-million output rate, less the blueprint tokens the brain would not have
+ *  emitted without scribe.
  *
  *  Because both the baseline and the actual cost carry the brain's identical
  *  exploration/thinking turn cost, that shared component cancels out of
  *  `baseline - actual`, leaving only the delegation delta: what the brain would
- *  have paid to emit the writer's tokens minus what the writer actually charged.
- *  Pricing the baseline from the brain's input cost alone instead kept the shared
- *  output cost on the actual side only, which forced the baseline below the
- *  actual cost and clamped every run's net savings to $0.00.
+ *  have paid to emit the document (net of the blueprint it replaces) minus what
+ *  the writer actually charged.  Pricing the baseline from the brain's input cost
+ *  alone instead kept the shared output cost on the actual side only, which forced
+ *  the baseline below the actual cost and clamped every run's net savings to $0.00.
  *
  *  When `brainOutputRatePerMillionUsd` is zero, `priced` is `false`.  If the
  *  reference model's rates are available, the baseline is instead priced from
- *  them — the brain's input tokens at the reference input rate plus the writer's
- *  output tokens at the reference output rate — and `baselineIsEstimate` is
+ *  them — the brain's input tokens at the reference input rate plus the document's
+ *  net output tokens at the reference output rate — and `baselineIsEstimate` is
  *  `true`, so an unpriced live model still reports a nonzero estimated baseline
  *  instead of collapsing net savings to $0.00.  Without reference rates the
  *  baseline reduces to `brainActualTotalCostUsd` alone (lower bound). */
@@ -78,11 +86,14 @@ export function computeCosts(input: CostComputationInput): CostComputationResult
   const hasReferenceRates =
     input.referenceInputRatePerMillionUsd !== 0 || input.referenceOutputRatePerMillionUsd !== 0;
   const baselineIsEstimate = !priced && hasReferenceRates;
+  /** Document tokens the brain would have emitted in the writer's place, less the
+   *  blueprint it emitted instead — the delegation delta the baseline prices. */
+  const delegatedOutputTokens = input.documentOutputTokens - input.blueprintOutputTokens;
   const baselineCostUsd = baselineIsEstimate
     ? (input.brainInputTokens * input.referenceInputRatePerMillionUsd
-        + input.writerOutputTokens * input.referenceOutputRatePerMillionUsd) / 1e6
+        + delegatedOutputTokens * input.referenceOutputRatePerMillionUsd) / 1e6
     : input.brainActualTotalCostUsd
-      + (input.writerOutputTokens * input.brainOutputRatePerMillionUsd) / 1e6;
+      + (delegatedOutputTokens * input.brainOutputRatePerMillionUsd) / 1e6;
   const netSavingsUsd = Math.max(0, baselineCostUsd - actualCostUsd);
   return { actualCostUsd, baselineCostUsd, netSavingsUsd, priced, baselineIsEstimate };
 }
