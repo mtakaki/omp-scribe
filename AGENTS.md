@@ -8,17 +8,18 @@
 
 ### Purpose
 
-During oh-my-pi's plan mode, the expensive (high-quality) model traditionally authores the entire plan-document Markdown body (~2000–5000 tokens). This extension reduces that token cost by having the expensive model submit only a **compact blueprint** — JSON metadata plus dense Tokenized Architectural Diff (TAD) step lines (~500 bytes), whose referenced file line-ranges the extension hydrates from disk — then delegating Markdown expansion to a **cheap model** (e.g., `@smol` role) via a private nested session.
+During oh-my-pi's plan mode, the expensive (high-quality) model traditionally authores the entire plan-document Markdown body (~2000–5000 tokens). This extension reduces that token cost by having the expensive model submit only a **compact blueprint** — JSON metadata plus **Scribe IR** (a `files` table of positional `[id, path, reason]` tuples and a `steps` array of `[fileId, operation, range, intent, preserve, doNot]` tuples, ~500 bytes), whose referenced file line-ranges the extension hydrates from disk — then delegating Markdown expansion to a **cheap model** (e.g., `@smol` role) via a private nested session.
 
-The extension transparently swaps the cheap-model output before the native `write` tool executes, so the expensive model never emits the plan body itself. All other plan-mode mechanics (approval UI, file destination, native workflow) remain unchanged.
+The extension transparently swaps the cheap-model output before the native `write` tool executes, so the expensive model never emits the plan body itself. Refinements after the first draft never re-emit it either: the expensive model submits a small delta through `propose_plan_update`, the cheap model rewrites only the sections that delta names, and `src/plan-sections.ts` splices those sections into the plan file already on disk, leaving every section the update did not name byte-identical. All other plan-mode mechanics (approval UI, file destination, native workflow) remain unchanged.
 
 ### Key Mechanism
 
-1. **On plan-mode turn**: Extension injects a `propose_plan_blueprint` tool and directive.
-2. **Expensive model**: Calls `propose_plan_blueprint` with compact JSON metadata plus one TAD line per approach step; calls `write` with placeholder `"pending"`.
-3. **Tool handler**: Parses each TAD line, hydrates its referenced line range from disk, then spawns a nested cheap-model session to expand the resulting plain-text brief into Markdown; caches result.
+1. **On plan-mode turn**: Extension activates `propose_plan_blueprint` and `propose_plan_update` together and injects the `<scribe>` directive.
+2. **Expensive model**: Calls `propose_plan_blueprint` with compact JSON metadata plus the Scribe IR `files`/`steps` tuples; calls `write` with placeholder `"pending"`.
+3. **Tool handler**: Validates and resolves that IR, hydrates each step's referenced line range from disk, then spawns a nested cheap-model session to expand the resulting plain-text brief into Markdown; caches result under the blueprint slug.
 4. **Write interception**: Extension intercepts the `write` call, swaps placeholder for cached Markdown, then native write tool executes.
-5. **Result**: Expensive model token footprint drops from ~2500 tokens to ~7 bytes (the placeholder).
+5. **Refinement**: For a later change the expensive model calls `propose_plan_update` with only the fields that changed (plus optional `drop` headings) and `write`s the placeholder again; the cheap model rewrites just those sections against the plan text read from disk or the newest pending draft, and the extension splices them in.
+6. **Result**: Expensive model token footprint drops from ~2500 tokens to ~7 bytes (the placeholder) per plan write, and to a compact delta JSON per refinement.
 
 ---
 
@@ -28,11 +29,12 @@ The extension transparently swaps the cheap-model output before the native `writ
 
 | Module | Purpose | Key Exports | Lines |
 |--------|---------|-------------|-------|
-| `src/types.ts` | Compact blueprint shape shared between expensive and cheap models | `PlanBlueprint`, `PlanBlueprintFile`, `DocBlueprint`, `DocBlueprintSection` | 42 |
-| `src/tad.ts` | Tokenized Architectural Diff parsing and line-range hydration from disk | `TAD_LINE_RE`, `TAD_LINE_SHAPE`, `TadStep`, `parseTadLine()`, `hydrateTadStep()` | 151 |
-| `src/config.ts` | Flags, plan-mode detection, plan-file resolution, oh-my-pi contracts, persisted per-project writer-model config, footer-status formatter, process-wide draft stores | `isPlanModeActive()`, `isPlanModeBranch()`, `planFileTarget()`, `pendingPlanEntry()`, `readScribeConfig()`, `registerScribeFlags()`, `readPersistedScribeConfig()`, `writePersistedScribeConfig()`, `formatScribeStatus()`, `pendingMarkdownStore()`, `PendingBlueprint` | 396 |
-| `src/writer-session.ts` | Nested session spawning; cheap-model expansion engine; TAD step hydration | `expandBlueprintToMarkdown()`, `expandDocBlueprintToMarkdown()`, `buildPlanPromptText()`, `ExpandResult` type, `WRITER_SYSTEM_PROMPT`, `DOC_WRITER_SYSTEM_PROMPT` | 203 |
-| `src/index.ts` | Extension factory; lifecycle events, tool registration, footer-status wiring, state management, write-content swap | Default export `scribe(pi: ExtensionAPI)` | 608 |
+| `src/types.ts` | Compact blueprint shapes shared between expensive and cheap models | `ScribeFile`, `ScribeStep`, `PlanBlueprint`, `PlanUpdateBlueprint`, `DocBlueprint`, `DocBlueprintSection` | 91 |
+| `src/scribe-ir.ts` | Scribe IR validation, file-id resolution, and line-range hydration from disk | `validateScribeBlueprint()`, `resolveScribeSteps()`, `hydrateScribeStep()`, `ScribeIrBlueprint`, `HydratedScribeStep` | 200 |
+| `src/plan-sections.ts` | Pure plan-document section surgery: split, splice replacements, drop sections | `PLAN_SECTIONS`, `CANONICAL_PLAN_SECTIONS`, `splitPlanSections()`, `splicePlanSections()`, `planHeadingKey()`, `scanPlanHeadings()` | 181 |
+| `src/config.ts` | Flags, plan-mode detection, plan-file resolution, `local://` artifact resolution, oh-my-pi contracts, persisted per-project writer-model config, footer-status formatter, process-wide draft stores | `isPlanModeActive()`, `isPlanModeBranch()`, `planFileTarget()`, `pendingPlanEntry()`, `resolveLocalArtifactPath()`, `readScribeConfig()`, `registerScribeFlags()`, `readPersistedScribeConfig()`, `writePersistedScribeConfig()`, `formatScribeStatus()`, `pendingMarkdownStore()`, `PendingBlueprint` | 471 |
+| `src/writer-session.ts` | Nested session spawning; cheap-model expansion engine; Scribe IR hydration; plan-section rewrites | `expandBlueprintToMarkdown()`, `expandPlanUpdateToMarkdown()`, `expandDocBlueprintToMarkdown()`, `buildPlanPromptText()`, `buildPlanUpdatePromptText()`, `planUpdateHeadings()`, `planUpdateDrops()`, `deltaSupplies()`, `ExpandResult` type, `WRITER_SYSTEM_PROMPT`, `PLAN_UPDATE_WRITER_SYSTEM_PROMPT`, `DOC_WRITER_SYSTEM_PROMPT` | 448 |
+| `src/index.ts` | Extension factory; lifecycle events, tool registration, footer-status wiring, state management, write-content swap | Default export `scribe(pi: ExtensionAPI)` | 902 |
 
 ### Data Flow
 
@@ -40,21 +42,21 @@ The extension transparently swaps the cheap-model output before the native `writ
 Plan-mode turn starts
     ↓
 before_agent_start event fires
-    ├─ Detect plan mode (isPlanModeActive → last mode_change in session branch)
-    ├─ Activate propose_plan_blueprint tool
+    ├─ Detect plan mode (isPlanModeActive → newest mode entry in session branch)
+    ├─ Activate propose_plan_blueprint + propose_plan_update
     └─ Inject SCRIBE_DIRECTIVE
         ↓
 Expensive model reads system prompt
-    ├─ Calls propose_plan_blueprint with TAD-line array in approach field
+    ├─ Calls propose_plan_blueprint with compact metadata plus files/steps Scribe IR
     │    ↓
     │    Tool execute handler
     │    ├─ Spawn private AgentRegistry + tools-free nested session
-    │    ├─ Parse each approach string with parseTadLine()
-    │    ├─ Hydrate each TAD step in parallel with hydrateTadStep() (reads project-relative file, extracts line range)
-    │    ├─ Build labeled plain-text prompt with buildPlanPromptText()
+    │    ├─ validateScribeBlueprint() then resolveScribeSteps()
+    │    ├─ Hydrate each resolved step in parallel with hydrateScribeStep() (reads project-relative file, extracts line range)
+    │    ├─ Build labeled plain-text brief with buildPlanPromptText()
     │    ├─ Send prompt text to cheap writer model via session.prompt()
     │    ├─ Collect expanded Markdown via session.subscribe()
-    │    ├─ Store in pendingMarkdownStore()[slug] as PendingBlueprint { sessionKey, markdown }
+    │    ├─ Store in pendingMarkdownStore()[slug] as PendingBlueprint { sessionKey, markdown, … }
     │    └─ Return success message
     │
     ├─ Calls write with path=local://<slug>-plan.md, content="pending"
@@ -65,17 +67,33 @@ Expensive model reads system prompt
     │    ├─ Found! Swap content with expanded Markdown
     │    └─ Return modified input to native write tool
     │
-    └─ write tool executes with full Markdown body
-        ├─ Expensive model never saw the full Markdown
-        └─ File written complete
-            ↓
+    ├─ write tool executes with full Markdown body
+    │    ├─ Expensive model never saw the full Markdown
+    │    └─ File written complete
+    │
+    ├─ Refinement: calls propose_plan_update with only the fields that changed
+    │    ↓
+    │    Tool execute handler
+    │    ├─ planUpdateHeadings()/planUpdateDrops() → the sections to rewrite and the ones to delete
+    │    ├─ Resolve the current plan text: the newest pending draft, else readPlanArtifact()
+    │    │    (resolveLocalArtifactPath() → <artifactsDir>/local/<slug>-plan.md, then PLAN.md)
+    │    ├─ Reject a delta with no changes, or steps arriving without their files
+    │    ├─ expandPlanUpdateToMarkdown(): validate + hydrate the delta's steps, then brief the writer
+    │    │    with each requested section's current text plus the delta (buildPlanUpdatePromptText)
+    │    ├─ Require the writer to return every requested heading, else fail leaving the store empty
+    │    ├─ splicePlanSections(currentText, replacements, drops) → unnamed sections keep their exact bytes
+    │    ├─ Store in pendingMarkdownStore()[slug] with deltaDocOutputTokens
+    │    └─ Return the same call-write-with-pending instruction
+    │
+    └─ Writes the placeholder again → tool_call swaps the spliced document (same path as above)
+        ↓
     Continue to xd://propose (native approval flow)
 ```
 
 ### State Management
 
 **Process-wide singleton store** (`pendingMarkdownStore()` in `config.ts`):
-- **`pendingMarkdownStore(): Map<string, PendingBlueprint>`** — Keyed by `slug` → `PendingBlueprint { sessionKey, markdown }`. Lives on `globalThis` under a namespaced key so all factory invocations share exactly one store, preventing cache misses across hot-reloads or duplicate module imports.
+- **`pendingMarkdownStore(): Map<string, PendingBlueprint>`** — Keyed by `slug` → `PendingBlueprint { sessionKey, markdown, writerModel, writerUsage, writerCostUsd, irOutputTokens, deltaDocOutputTokens? }`. Lives on `globalThis` under a namespaced key so all factory invocations share exactly one store, preventing cache misses across hot-reloads or duplicate module imports. `deltaDocOutputTokens` is set only by `propose_plan_update` (the estimated tokens of the sections it regenerated, so incremental updates are priced against the delta rather than the whole document); the write swap falls back to measuring `markdown` when it is absent.
 
 **Persisted per-project config** (`.claude/plans/scribe_config.json`, `config.ts`):
 - **`readPersistedScribeConfig(cwd)` / `writePersistedScribeConfig(cwd, patch)`** — The `/scribe-model` override lives here (`{ writerModel: "provider/id" }`). Writes are atomic (temp sibling + `rename`) and read failures self-heal to `{}`; a patch field set to `undefined` deletes the key.
@@ -91,9 +109,10 @@ Expensive model reads system prompt
 |-------|--------|
 | Load-time | `registerScribeFlags()` called; tools registered (inactive) |
 | `session_start` | `cfg = await readScribeConfig(pi, ctx.cwd)`; model list captured; footer set to idle/doc-armed/plan |
-| `before_agent_start` (plan branch) | Blueprint tool activated; `<scribe>` directive injected; footer set to `● plan` |
-| `before_agent_start` (non-plan branch) | Blueprint tool deactivated; no directive; footer set to idle/doc-armed |
+| `before_agent_start` (plan branch) | Plan tools (`propose_plan_blueprint`, `propose_plan_update`) activated together; `<scribe>` directive injected; footer set to `● plan` |
+| `before_agent_start` (non-plan branch) | Plan tools deactivated; no directive; footer set to idle/doc-armed |
 | Blueprint tool execute | Footer gains the draft: `● plan — <n> chars drafted (writer: <provider/id>)`, or `✗ … expansion failed — <reason>` |
+| Update tool execute | Same draft footer; a drop-only delta needs no writer session and records the `scribe/splice` identity with zero writer tokens |
 | `tool_call` (write to a plan file with a pending draft) | Content swapped; store entry deleted; footer returns to its mode-only state |
 | `session_shutdown` | Store entries whose `sessionKey` matches current session deleted; footer cleared |
 | `/scribe-model` | Resolves and persists the chosen writer model (or clears it on `reset`), then refreshes the footer |
@@ -108,18 +127,20 @@ All footer writes go through `ctx.ui.setStatus("scribe", …)` and are skipped w
 .
 ├── src/
 │   ├── index.ts              # Extension factory; events, tool registration, state
-│   ├── config.ts             # Flags, plan-mode detection, plan-file resolution
-│   ├── writer-session.ts     # Nested session spawning; expansion logic
-│   ├── tad.ts               # TAD parsing and line-range hydration engine
+│   ├── config.ts             # Flags, plan-mode detection, plan-file/artifact resolution
+│   ├── writer-session.ts     # Nested session spawning; expansion and section-rewrite logic
+│   ├── scribe-ir.ts          # Scribe IR validation, resolution, and line-range hydration
+│   ├── plan-sections.ts      # Pure plan-document section split/splice engine
 │   ├── stats-store.ts        # Savings JSON read/append + /savings dashboard
 │   ├── pricing.ts            # Dual-model cost math + @plan-role baseline fallback
-│   └── types.ts              # Core domain types (PlanBlueprint, DocBlueprint)
+│   └── types.ts              # Core domain types (PlanBlueprint, PlanUpdateBlueprint, DocBlueprint)
 ├── tests/                    # bun test suites + fakes (tests/support/)
 ├── dist/                     # Compiled ES2022 output (generated by npm run build)
 │   ├── index.js              # Entry point for oh-my-pi extension loader
 │   ├── config.js
 │   ├── writer-session.js
-│   ├── tad.js
+│   ├── scribe-ir.js
+│   ├── plan-sections.js
 │   └── types.js
 ├── package.json              # Manifest; declares devDependencies, build scripts, omp config
 ├── tsconfig.json             # TypeScript compiler settings (ES2022, ESNext, strict)
@@ -331,13 +352,16 @@ Three hardcoded assumptions about oh-my-pi's internals (documented in `config.ts
 - **`dist/index.js`** — Compiled entry point loaded by oh-my-pi. Exports default function `scribe(pi)`. All event handlers, tool registration, and state management defined here.
 
 ### Configuration & Detection
-- **`src/config.ts`** — Flag registration, plan-mode detection (`isPlanModeActive()`/`isPlanModeBranch()`), plan-file resolution (`planFileTarget()`, `pendingPlanEntry()`) and doc-draft resolution (`pendingDocEntry()`), per-project writer-model persistence (`readPersistedScribeConfig()`/`writePersistedScribeConfig()`), the footer renderer (`formatScribeStatus()`), and the process-wide pending-draft singletons (`pendingMarkdownStore()`, `pendingDocMarkdownStore()`, `armedDocSessions()`, `docDraftHistory()`, `consumedWriteSwaps()`). Update the mode-entry and plan-file constants here if oh-my-pi's plan-mode internals change.
+- **`src/config.ts`** — Flag registration, plan-mode detection (`isPlanModeActive()`/`isPlanModeBranch()`), plan-file resolution (`planFileTarget()`, `pendingPlanEntry()`) and doc-draft resolution (`pendingDocEntry()`), `local://` artifact lookups for the update path (`resolveLocalArtifactPath()`), per-project writer-model persistence (`readPersistedScribeConfig()`/`writePersistedScribeConfig()`), the footer renderer (`formatScribeStatus()`), and the process-wide pending-draft singletons (`pendingMarkdownStore()`, `pendingDocMarkdownStore()`, `armedDocSessions()`, `docDraftHistory()`, `consumedWriteSwaps()`). Update the mode-entry, plan-file, and `local://`-root constants here if oh-my-pi's internals change.
+
+### Plan Sections
+- **`src/plan-sections.ts`** — Pure text engine for delegated plan updates: `splitPlanSections()` (fence-aware `##` splitter whose chunks concatenate back to the input byte-for-byte), `splicePlanSections()` (replace in place, insert at the canonical position, append unknown headings, delete dropped ones, and keep every unnamed section verbatim), plus `PLAN_SECTIONS`/`CANONICAL_PLAN_SECTIONS`. It reads no files and imports no host APIs. Update `PLAN_SECTIONS` if the plan-document section names or order change; if the heading level changes, update the section regex too.
 
 ### Expansion Engine
-- **`src/writer-session.ts`** — Nested session spawning, plan-mode TAD hydration plus plain-text brief assembly, and doc-mode JSON expansion. Only place where `sdk.createAgentSession()` is called. If writer-model behavior needs tuning, edit `WRITER_SYSTEM_PROMPT` / `DOC_WRITER_SYSTEM_PROMPT` here.
+- **`src/writer-session.ts`** — Nested session spawning, plan-mode Scribe IR hydration plus plain-text brief assembly, plan-section rewrites, and doc-mode JSON expansion. Only place where `sdk.createAgentSession()` is called. If writer-model behavior needs tuning, edit `WRITER_SYSTEM_PROMPT` / `PLAN_UPDATE_WRITER_SYSTEM_PROMPT` / `DOC_WRITER_SYSTEM_PROMPT` here.
 
 ### Type Definitions
-- **`src/types.ts`** — Core domain types. Plan-mode steps are TAD line strings (`approach: string[]`, parsed in `src/tad.ts`); the doc-mode outline is still shared between expensive and cheap models via JSON serialization.
+- **`src/types.ts`** — Core domain types. Plan-mode steps are positional tuples validated by `src/scribe-ir.ts`; `PlanUpdateBlueprint` is the incremental delta `propose_plan_update` accepts; the doc-mode outline is shared between expensive and cheap models via JSON serialization.
 
 ### Build Configuration
 - **`package.json`** — Manifest; defines devDependencies, build scripts, `"omp.extensions"` config pointing to `dist/index.js`.
@@ -379,7 +403,7 @@ Three hardcoded assumptions about oh-my-pi's internals (documented in `config.ts
 
 ### Test Framework
 
-**Unit/integration suite**: `bun test` (files under `tests/`, fakes in `tests/support/`). It covers detection, tool registration and execution, the write swap, doc mode, stats, pricing, writer-model resolution/persistence, and footer-status transitions. Run `npm run typecheck` first — it type-checks `src/` and `tests/`.
+**Unit/integration suite**: `bun test` (files under `tests/`, fakes in `tests/support/`). It covers detection, tool registration and execution, the write swap, delegated plan updates, the plan-section splice engine, doc mode, stats, pricing, writer-model resolution/persistence, and footer-status transitions. Run `npm run typecheck` first — it type-checks `src/` and `tests/`.
 
 **Manual verification of the live flow** (the suite cannot model the host's plan mode):
 
@@ -387,27 +411,36 @@ Three hardcoded assumptions about oh-my-pi's internals (documented in `config.ts
 2. **Interactive plan-mode run**: plain `omp` in a scratch directory, then `/plan`, then a plan request. Detection reads the session branch, so plan mode must be entered *before* the prompt; `omp --plan-yolo -p "..."` only becomes detectable on the second turn, because `--plan-yolo` arms plan mode in-session without persisting a `mode_change` entry.
    Verify:
    - the footer reads `Scribe ○ idle (writer: …)` at session start and `Scribe ● plan (writer: …)` once plan mode is on
-   - `propose_plan_blueprint` is offered and accepts a compact payload with TAD-line approach steps
+   - both `propose_plan_blueprint` and `propose_plan_update` are offered and the blueprint tool accepts a compact payload with Scribe IR `files`/`steps` tuples
    - the footer then reads `Scribe ● plan — <n> chars drafted (writer: <provider/id>)`, reverting to the mode-only line after the `write` swap
    - the `write` call with placeholder `"pending"` succeeds and the plan file contains the full expanded Markdown
-   - `savings_stats.json` under `<cwd>/.claude/plans/` gains a `mode: "plan"` run
-3. **Inert check**: in a directory with no plan state, a normal turn must not activate the blueprint tool nor inject the `<scribe>` directive.
-4. **Writer-model configuration**: run `/scribe-model` (the picker must list authenticated models), `/scribe-model <provider/id>`, and `/scribe-model reset`. Verify the footer updates immediately in each case, `.claude/plans/scribe_config.json` gains or loses its `writerModel` key, an unresolvable spec leaves both untouched, and a *new* session in that project starts on the persisted model. In a non-UI session (`omp -p`), `/scribe-model` must report the current model instead of blocking on a picker.
+   - `savings_stats.json` under `<cwd>/.claude/plans/` gains a `mode: "plan"` run whose `docOutputTokens` measures the whole document
+3. **Delegated plan update**: in that same plan-mode turn, copy the plan file aside and ask for a refinement (e.g. "record one extra constraint: …"). Expect `propose_plan_update` followed by `write` with content `"pending"`, and no hand-written plan Markdown.
+   Verify:
+   - the tool result names the rewritten headings and the plan file under the session's `local://` root contains the newly rendered section under its own `##` heading, with the literal placeholder never written
+   - `diff` against the copy shows every section the update did not name is byte-identical (only the rewritten section changed)
+   - `savings_stats.json` gains a second `mode: "plan"` run whose `docOutputTokens` matches roughly the regenerated sections' token estimate, not the whole document (the `/savings` "Delegated doc tokens (est.)" row excludes the unchanged sections)
+   - the footer shows the plan draft line after the update, then reverts to the mode-only line after the swap
+   - failure paths: calling `propose_plan_update` before any plan file exists reports a locate failure telling the model to call `propose_plan_blueprint` first, and a `write` with content `"pending"` after a failed update is still blocked with the existing no-drafted-Markdown reason
+4. **Inert check**: in a directory with no plan state, a normal turn must not activate the plan tools nor inject the `<scribe>` directive.
+5. **Writer-model configuration**: run `/scribe-model` (the picker must list authenticated models), `/scribe-model <provider/id>`, and `/scribe-model reset`. Verify the footer updates immediately in each case, `.claude/plans/scribe_config.json` gains or loses its `writerModel` key, an unresolvable spec leaves both untouched, and a *new* session in that project starts on the persisted model. In a non-UI session (`omp -p`), `/scribe-model` must report the current model instead of blocking on a picker.
 
 This `-e`/`--extension` invocation is session-scoped: it will not register the extension as an installed package, so it never appears in the interactive `/extensions` (Extension Control Center) UI. To confirm `/extensions` visibility, run `npm run link:local` (`omp plugin link .`) once, then open a plain `omp` session (no `-e` needed) and check `/extensions` → `OMP Extension Packages` for `omp-scribe`.
 
-5. **Transcript inspection**: After a plan-mode session, inspect the transcript (stored in `~/.omp/agent/sessions/`) to confirm the `propose_plan_blueprint` call carried compact metadata plus TAD step lines rather than Markdown prose. Note that in omp 18.2.6 a `tool_call` revision is applied before the call is persisted, so the recorded `write` arguments show the swapped Markdown; the savings stats entry is the direct evidence that the swap ran.
+6. **Transcript inspection**: After a plan-mode session, inspect the transcript (stored in `~/.omp/agent/sessions/`) to confirm the `propose_plan_blueprint` call carried compact metadata plus Scribe IR tuples rather than Markdown prose, and that any refinement used `propose_plan_update` with only the changed fields. Note that in omp 18.2.6 a `tool_call` revision is applied before the call is persisted, so the recorded `write` arguments show the swapped Markdown, and the `tool_result` annotation ("The <n>-character draft from <model> replaced the content you submitted") plus the savings stats entry are the direct evidence that the swap ran.
 
 ### Coverage Expectations
 
 - ✅ Plan-mode detection (`mode_change`/`plan-mode-context` in the session branch; `plan_paused` and non-plan modes are inactive)
-- ✅ Tool activation/deactivation (blueprint tool active only in plan turns)
-- ✅ Blueprint expansion (the cheap model expands the TAD-line brief, hydrated from disk, into Markdown successfully)
+- ✅ Tool activation/deactivation (both plan tools active only in plan turns, neither on a doc-armed or idle turn)
+- ✅ Blueprint expansion (the cheap model expands the Scribe IR brief, hydrated from disk, into Markdown successfully)
 - ✅ Cache management (expanded Markdown cached in the process-wide singleton store, keyed by slug; deleted after use)
 - ✅ Write-content swap (placeholder swapped for the expanded Markdown before the write executes; `local://PLAN.md` resolves through the session's only draft)
 - ✅ Error cases (expansion failure, empty response, unmatched placeholder on a plan-file path, wrong path)
 - ✅ Fallback modes (model bypasses the blueprint tool and writes real Markdown; no interference)
-- ✅ TAD parsing & hydration (`TAD_LINE_RE` regex validation of the format `@path/to/file.ext[start-end]{+|!|~}deps(...)#intent`; `parseTadLine()` rejection of malformed lines and inverted ranges; `hydrateTadStep()` resolves project-relative paths, reads files, extracts line ranges, 200-line cap, missing-file/outside-root notes; test suite in `tests/tad.test.ts`)
+- ✅ Scribe IR validation, resolution & hydration (`validateScribeBlueprint` rejection of malformed file/step tuples, unknown file ids, invalid operations, inverted ranges, empty strings — with the step requirement optional for the delta path; `hydrateScribeStep` resolving project-relative paths, reading files, extracting line ranges, 200-line cap, missing-file/outside-root notes; test suite in `tests/scribe-ir.test.ts`)
+- ✅ Plan-section splice engine (`tests/plan-sections.test.ts`: replacement in place leaves other sections byte-identical, a missing heading inserts at its canonical position, an unknown heading appends, drops remove the named section, fenced code blocks are ignored, and an update naming nothing returns the input unchanged)
+- ✅ Delegated plan updates (tool registration and plan-mode-only activation, delta shape rejection for no-changes and steps-without-files, IR validation errors surfaced without storing a draft, `local://` artifact resolution from the artifacts dir and the temp-root fallback, locate failures, empty plan files, a writer response missing a requested heading rejected with the plan left untouched, drop-only deltas applied without a writer session, sequential updates building on the pending draft, the write swap finalizing the spliced plan, `deltaDocOutputTokens` pricing only the regenerated sections, and update failures incrementing the blueprint failure counters)
 - ✅ Baseline pricing (`@plan`-role fallback: an unpriced brain model prices its baseline from the reference model's rates with `baselineIsEstimate` tracking and `~$` dashboard marking; an unresolvable role keeps the legacy $0.00 lower bound)
 - ✅ Writer-model precedence (non-default CLI flag → persisted override → `@smol`) and persistence (round-trip, ENOENT/malformed/wrong-type self-heal, key removal on reset)
 - ✅ Footer status (`idle`/`doc armed`/`plan`/`doc`/draft/`failed` strings, per-turn recomputation, draft revert after the swap, clear on shutdown, nothing written without UI)
@@ -448,15 +481,24 @@ npm run build      # Compile to dist/
 4. Access in event handlers via closure-captured `cfg` variable (e.g., `cfg.writerModel`).
 5. Rebuild: `npm run build`
 
-### Maintaining the TAD Wire Format
+### Maintaining the Scribe IR Wire Format
 
-Plan-mode step encoding lives in `src/tad.ts` (the regex `TAD_LINE_RE`, the shape description `TAD_LINE_SHAPE`, and the parser `parseTadLine()`). Any change to the wire format—regex syntax, operation tags, dependencies encoding, or intent label structure—must update all three in lock-step:
+Plan-mode step encoding is the positional-tuple IR described by `ScribeFile`/`ScribeStep` in `src/types.ts` and validated by `validateScribeBlueprint()` in `src/scribe-ir.ts` (the tool boundary's Zod schema can only assert fixed-length arrays of unknowns, so the per-position semantics live there). Any change to the tuple shape must update these in lock-step:
 
-1. **Update `TAD_LINE_RE`** in `src/tad.ts` to validate the new syntax.
-2. **Update `TAD_LINE_SHAPE`** string to reflect the human-readable format (used in error messages and prompts).
-3. **Update the `<scribe>` directive** in `src/index.ts` to teach the model the new syntax.
-4. **Update `WRITER_SYSTEM_PROMPT`** in `src/writer-session.ts` to decode the new format correctly.
-5. Rebuild and test: `npm run typecheck && npm run build && bun test`.
+1. **Update `ScribeFile`/`ScribeStep`** in `src/types.ts` (and `PlanUpdateBlueprint` if the delta's field set changes).
+2. **Update `validateScribeBlueprint()`** in `src/scribe-ir.ts` — the tuple-length checks, per-position checks, and error messages — plus `resolveScribeSteps()` if the resolution changes.
+3. **Update the Zod schemas** for `propose_plan_blueprint`/`propose_plan_update` in `src/index.ts` so the boundary enforces the new tuple lengths and field set.
+4. **Update the `<scribe>` directive** in `src/index.ts` to teach the model the new shape, including the delta path's once-per-refinement rule.
+5. **Update `WRITER_SYSTEM_PROMPT`, `PLAN_UPDATE_WRITER_SYSTEM_PROMPT`, and `buildPlanPromptText()`/`buildPlanUpdatePromptText()`** in `src/writer-session.ts` to decode the new shape correctly.
+6. Rebuild and test: `npm run typecheck && npm run build && bun test`.
+
+### Maintaining the Plan-Section Contract
+
+Delegated updates depend on the plan-document structure the initial expansion emits:
+
+1. **Section names and order** live in `PLAN_SECTIONS` (`src/plan-sections.ts`), from which `CANONICAL_PLAN_SECTIONS` is derived; keep them in step with the section headings `WRITER_SYSTEM_PROMPT` fixes. A heading level change requires updating `SECTION_HEADING_RE` too.
+2. **The writer's section contract** — one `## <heading>` per requested section, spelled as the brief spells it — is enforced by the update tool, which rejects a response missing any requested heading rather than splicing nothing.
+3. Rebuild and test: `npm run typecheck && npm run build && bun test`.
 
 ### Updating oh-my-pi Contracts
 
@@ -464,8 +506,10 @@ If oh-my-pi changes its plan-mode internals:
 
 1. **If the mode-entry contract changes** (entry type or `mode` vocabulary): update `PLAN_MODE_CONTEXT_CUSTOM_TYPE` / `PLAN_MODE_EXITED_CUSTOM_TYPES` and the `mode_change` check in `isPlanModeBranch()` in `config.ts`.
 2. **If plan-file naming changes** (charset or suffix): update `PLAN_FILE_PATH_RE` in `config.ts` (line 22) and the `planFileTarget()` slug rule.
-3. **If `ExtensionAPI` interface changes**: Update type imports in `src/*.ts` (header comments); recompile and test.
-4. **If tool lifecycle events change**: Update event handler signatures in `index.ts`.
+3. **If the `local://` root layout changes** (artifacts-dir child name, temp-dir fallback, or session-id sanitising): update `resolveLocalArtifactPath()` and its `LOCAL_ROOT_DIR_NAME`/`safeSessionId` helpers in `config.ts`, which mirror the host's `resolveLocalRoot` without importing it. Verified against omp 18.2.11: `local://<name>` lives at `<session-dir>/local/<name>`, surfaced to extensions as `ctx.localProtocolOptions.getArtifactsDir()`.
+4. **If the plan tools' names or options change**: keep `PLAN_MODE_TOOL_NAMES`/`SCRIBE_TOOL_NAMES` in `index.ts` in step with the registered tool names, since activation, brain-usage accumulation, and failure counting all key off them.
+5. **If `ExtensionAPI` interface changes**: Update type imports in `src/*.ts` (header comments); recompile and test.
+6. **If tool lifecycle events change**: Update event handler signatures in `index.ts`.
 
 Rebuild after any contract changes: `npm run build && npm run typecheck && bun test`
 

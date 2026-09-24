@@ -33,6 +33,10 @@ export interface FakeContextOverrides {
    *  The array is returned as-is, letting a test mutate it to simulate a mode
    *  transition between turns. */
   branch?: unknown[];
+  /** Directory `ctx.localProtocolOptions.getArtifactsDir()` reports; the plan
+   *  artifact resolver looks for `local://` files under its `local/` child.
+   *  `null`/absent leaves only the OS-temp fallback root. */
+  artifactsDir?: string | null;
 }
 
 /** One `ctx.ui.select()` invocation: the dialog title plus the normalized
@@ -78,7 +82,10 @@ export function createFakeExtensionContext(overrides: FakeContextOverrides = {})
     modelRegistry: {
       authStorage: {},
     },
-    localProtocolOptions: undefined,
+    localProtocolOptions: {
+      getArtifactsDir: () => overrides.artifactsDir ?? null,
+      getSessionId: () => overrides.sessionId ?? "fake-session",
+    },
     ui: {
       notify: (message: string, level: string) => {
         notifications.push({ message, level });

@@ -5,14 +5,15 @@
  * the fake API to exercise individual event paths.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import scribe from "../src/index";
-import { BLUEPRINT_TOOL_NAME, DOC_BLUEPRINT_TOOL_NAME, consumedWriteSwaps, pendingMarkdownStore, armedDocSessions, pendingDocMarkdownStore, docDraftHistory, readPersistedScribeConfig, SCRIBE_MODEL_CONFIG_RELATIVE_PATH, scribeModelConfigPath } from "../src/config";
-import { formatSavingsDashboard, readStatsFile } from "../src/stats-store";
+import { BLUEPRINT_TOOL_NAME, DOC_BLUEPRINT_TOOL_NAME, PLAN_UPDATE_TOOL_NAME, consumedWriteSwaps, pendingMarkdownStore, armedDocSessions, pendingDocMarkdownStore, docDraftHistory, readPersistedScribeConfig, SCRIBE_MODEL_CONFIG_RELATIVE_PATH, scribeModelConfigPath } from "../src/config";
+import { splitPlanSections } from "../src/plan-sections";
+import { estimateTextTokens, formatSavingsDashboard, readStatsFile } from "../src/stats-store";
 import { createFakeExtensionApi, createFakeExtensionContext, customMessageEntry, makeModel, modeChangeEntry, type FakeExtensionApi } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
@@ -690,6 +691,452 @@ describe("scribe: tool_call write swap", () => {
     expect(result?.input?.content).toBe("# Under\n\nBody.");
   });
 });
+// ─── propose_plan_update tool ────────────────────────────────────────────────
+
+/** An on-disk plan with four sections, so an update has neighbours to leave
+ *  alone on both sides of the section it rewrites. */
+const DISK_PLAN = [
+  "# Auth refresh plan",
+  "",
+  "## Context",
+  "",
+  "Add refresh tokens to the auth flow.",
+  "",
+  "## Approach",
+  "",
+  "- Modify `src/auth.ts` to issue refresh tokens.",
+  "",
+  "## Verification",
+  "",
+  "- `bun test tests/auth.test.ts` passes",
+  "",
+  "## Assumptions & contingencies",
+  "",
+  "- Tokens live 30 days",
+  "",
+].join("\n");
+
+const VERIFICATION_BULLET = "- `bun test tests/auth.test.ts` passes\n";
+const ADDED_BULLET = "- `bun test tests/auth-refresh.test.ts` passes\n";
+/** The rendered Verification section the writer returns for the standard update. */
+const VERIFICATION_SECTION = `## Verification\n\n${VERIFICATION_BULLET}${ADDED_BULLET}`;
+/** DISK_PLAN after that section is spliced in: one bullet added, nothing else. */
+const UPDATED_PLAN = DISK_PLAN.replace(VERIFICATION_BULLET, `${VERIFICATION_BULLET}${ADDED_BULLET}`);
+
+/** Writes `<name>` into the `local/` root of `artifactsDir`, where the plan
+ *  artifact resolver looks for `local://` files. */
+async function writeArtifact(artifactsDir: string, name: string, text: string): Promise<void> {
+  const dir = join(artifactsDir, "local");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, name), text, "utf8");
+}
+
+describe("scribe: propose_plan_update", () => {
+  it("registers the update tool as defaultInactive", () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const tool = fakeApi.tools.find(t => t.name === PLAN_UPDATE_TOOL_NAME);
+
+    expect(tool).toBeDefined();
+    expect(tool?.definition["defaultInactive"]).toBe(true);
+    expect(fakeApi.activeTools).not.toContain(PLAN_UPDATE_TOOL_NAME);
+  });
+
+  it("activates both plan tools on plan turns and neither off-plan", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), planModeContext({ cwd }).ctx);
+    expect(fakeApi.activeTools).toContain(BLUEPRINT_TOOL_NAME);
+    expect(fakeApi.activeTools).toContain(PLAN_UPDATE_TOOL_NAME);
+
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), createFakeExtensionContext({ cwd }).ctx);
+    expect(fakeApi.activeTools).not.toContain(BLUEPRINT_TOOL_NAME);
+    expect(fakeApi.activeTools).not.toContain(PLAN_UPDATE_TOOL_NAME);
+  });
+
+  it("leaves the update tool out of a doc-armed turn", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd, sessionId: "s-update-doc" });
+
+    armedDocSessions().add("s-update-doc");
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+
+    expect(fakeApi.activeTools).toContain(DOC_BLUEPRINT_TOOL_NAME);
+    expect(fakeApi.activeTools).not.toContain(PLAN_UPDATE_TOOL_NAME);
+  });
+
+  it("rewrites only the named section and caches the spliced plan", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx, statuses } = planModeContext({ cwd, artifactsDir });
+
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-1",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("Verification rewritten");
+    expect(text).toContain(`content "pending"`);
+
+    const entry = pendingMarkdownStore().get("auth-refresh");
+    expect(entry).toBeDefined();
+    // Sections the update did not mention survive byte-for-byte; the named one
+    // gains the delta and the rendered result replaces it in place.
+    expect(entry!.markdown).toBe(UPDATED_PLAN);
+    expect(entry!.deltaDocOutputTokens).toBe(estimateTextTokens(VERIFICATION_SECTION));
+    expect(entry!.deltaDocOutputTokens!).toBeLessThan(estimateTextTokens(entry!.markdown));
+    expect(statuses.get("scribe")).toBe(
+      `Scribe ● plan — ${UPDATED_PLAN.length} chars drafted (writer: anthropic/claude-haiku-3-5)`,
+    );
+  });
+
+  it("hands the writer the current section text alongside the delta", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript, lastSession } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-prompt",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    );
+
+    const prompt = lastSession()!.lastPrompt ?? "";
+    // Nothing the writer cannot see can be preserved: the brief carries the
+    // section's present text plus the change to fold in.
+    expect(prompt).toContain(VERIFICATION_BULLET);
+    expect(prompt).toContain(ADDED_BULLET);
+    expect(prompt).toContain("Verification");
+    expect(prompt).not.toContain("## Approach");
+  });
+
+  it("finalizes the spliced plan through the write swap and prices only the delta", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx, statuses } = planModeContext({ cwd, artifactsDir });
+
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+    await fakeApi.emit("message_end", makeMessageEndEvent("assistant", { input: 400, output: 60 }), ctx);
+    await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-swap",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    );
+
+    const swap = (await fakeApi.emit(
+      "tool_call",
+      makeWriteEvent("local://auth-refresh-plan.md", "pending", "tc-update-swap-1"),
+      ctx,
+    )) as { input?: { content: string } } | undefined;
+
+    expect(swap?.input?.content).toBe(UPDATED_PLAN);
+    expect(swap?.input?.content).not.toContain("pending");
+    expect(pendingMarkdownStore().has("auth-refresh")).toBe(false);
+    expect(statuses.get("scribe")).toBe("Scribe ● plan (writer: @smol)");
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.totalRuns).toBe(1);
+    expect(stats.runs[0]!.mode).toBe("plan");
+    // The baseline counts the regenerated section, not the whole document.
+    expect(stats.runs[0]!.docOutputTokens).toBe(estimateTextTokens(VERIFICATION_SECTION));
+    expect(stats.runs[0]!.docOutputTokens!).toBeLessThan(estimateTextTokens(UPDATED_PLAN));
+  });
+
+  it("builds a second update on the pending draft rather than on the older file", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, queueScripts, lastSession } = createFakeSdk();
+    queueScripts(successScript(VERIFICATION_SECTION), successScript(`## Verification\n\n${VERIFICATION_BULLET}${ADDED_BULLET}- \`bun test tests/auth-session.test.ts\` passes\n`));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-a",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    );
+    await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-b",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-session.test.ts` passes"] },
+      ctx,
+    );
+
+    // The second brief sees the first update's bullet, which only the pending
+    // draft holds — the file on disk still has neither.
+    expect(lastSession()!.lastPrompt).toContain(ADDED_BULLET);
+    expect(await readFile(join(artifactsDir, "local", "auth-refresh-plan.md"), "utf8")).toBe(DISK_PLAN);
+    expect(pendingMarkdownStore().get("auth-refresh")!.markdown).toBe(
+      UPDATED_PLAN.replace(ADDED_BULLET, `${ADDED_BULLET}- \`bun test tests/auth-session.test.ts\` passes\n`),
+    );
+  });
+
+  it("clears a dropped section without spawning a writer session", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, sessionCount } = createFakeSdk();
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-drop",
+      { slug: "auth-refresh", drop: ["Assumptions & contingencies"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    expect(sessionCount()).toBe(0);
+
+    const entry = pendingMarkdownStore().get("auth-refresh");
+    expect(entry).toBeDefined();
+    expect(splitPlanSections(entry!.markdown).sections.map(section => section.heading)).toEqual([
+      "Context",
+      "Approach",
+      "Verification",
+    ]);
+    expect(entry!.markdown).not.toContain("Tokens live 30 days");
+    expect(entry!.markdown).toContain(VERIFICATION_BULLET);
+    expect(entry!.deltaDocOutputTokens).toBe(0);
+  });
+
+  it("finds the plan under the OS temp root when the session has no artifacts dir", async () => {
+    const sessionId = `s-${randomUUID()}`;
+    const root = join(tmpdir(), "omp-local", sessionId);
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "auth-refresh-plan.md"), DISK_PLAN, "utf8");
+
+    try {
+      const { ctx } = planModeContext({ cwd, sessionId });
+      const result = (await fakeApi.callTool(
+        PLAN_UPDATE_TOOL_NAME,
+        "tcid-update-temp",
+        { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+        ctx,
+      )) as Record<string, unknown>;
+
+      expect(result["isError"]).toBeUndefined();
+      expect(pendingMarkdownStore().get("auth-refresh")!.markdown).toBe(UPDATED_PLAN);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a delta that carries no changes", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(PLAN_UPDATE_TOOL_NAME, "tcid-update-empty", { slug: "auth-refresh", verification: [] }, ctx)) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("carried no changes");
+    expect(pendingMarkdownStore().size).toBe(0);
+  });
+
+  it("rejects steps that arrive without their files", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-nofiles",
+      { slug: "auth-refresh", steps: [["A", "~", [1, 2], "Do the thing.", [], []]] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("steps without files");
+  });
+
+  it("surfaces malformed IR instead of splicing it", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-badid",
+      { slug: "auth-refresh", files: [["A", "src/auth.ts", "token issue path"]], steps: [["B", "~", [1, 2], "Do the thing.", [], []]] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain('unknown file id "B"');
+    expect(pendingMarkdownStore().size).toBe(0);
+  });
+
+  it("reports a locate failure and leaves the placeholder write blocked", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir: join(cwd, "artifacts") });
+
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-missing",
+      { slug: "auth-refresh", verification: ["`bun test` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("no plan file exists");
+    expect(text).toContain(BLUEPRINT_TOOL_NAME);
+    expect(pendingMarkdownStore().size).toBe(0);
+
+    const blocked = (await fakeApi.emit("tool_call", makeWriteEvent("local://auth-refresh-plan.md", "pending", "tc-update-missing"), ctx)) as
+      | { block?: boolean; reason?: string }
+      | undefined;
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("No drafted Markdown matches");
+    // The failed update leaves the write-swap path untouched, and the recovery
+    // hint names the update tool for a plan that already exists.
+    expect(blocked?.reason).toContain(BLUEPRINT_TOOL_NAME);
+    expect(blocked?.reason).toContain(PLAN_UPDATE_TOOL_NAME);
+  });
+
+  it("rejects an empty plan file", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", "\n");
+
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-emptyfile",
+      { slug: "auth-refresh", verification: ["`bun test` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("is empty");
+  });
+
+  it("rejects a writer response with no requested section heading and leaves the plan alone", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript("Verification looks fine as it stands."));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx, statuses } = planModeContext({ cwd, artifactsDir });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-unparseable",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("no \"Verification\" section heading");
+    expect(pendingMarkdownStore().size).toBe(0);
+    expect(await readFile(join(artifactsDir, "local", "auth-refresh-plan.md"), "utf8")).toBe(DISK_PLAN);
+    expect(statuses.get("scribe")?.startsWith("Scribe ✗ plan expansion failed")).toBe(true);
+
+    const blocked = (await fakeApi.emit("tool_call", makeWriteEvent("local://auth-refresh-plan.md", "pending", "tc-update-unparseable"), ctx)) as
+      | { block?: boolean }
+      | undefined;
+    expect(blocked?.block).toBe(true);
+  });
+
+  it("reports an unresolvable writer model in the footer", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx, statuses } = planModeContext({ cwd, artifactsDir, resolveModel: () => undefined });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-nomodel",
+      { slug: "auth-refresh", verification: ["`bun test` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect(statuses.get("scribe")?.startsWith("Scribe ✗ plan expansion failed — No model resolves")).toBe(true);
+  });
+
+  it("increments the blueprint failure counters when an update errors", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    await fakeApi.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-update-fail-1",
+      toolName: PLAN_UPDATE_TOOL_NAME,
+      input: {},
+      content: [{ type: "text", text: "Plan update cannot proceed" }],
+      isError: true,
+    }, ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.blueprintCallsTotal).toBe(1);
+    expect(stats.blueprintCallsFailed).toBe(1);
+  });
+});
+
 // ─── session_shutdown cleanup ─────────────────────────────────────────────────
 
 describe("scribe: session_shutdown", () => {

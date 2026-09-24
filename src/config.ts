@@ -1,5 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -15,6 +16,12 @@ export const PLACEHOLDER_CONTENT = "pending";
 
 /** Name of the compact doc-blueprint tool registered by this extension. */
 export const DOC_BLUEPRINT_TOOL_NAME = "propose_doc_blueprint";
+
+/** Name of the incremental plan-update tool registered by this extension.
+ *  Registered inactive like the blueprint tool and activated only on plan-mode
+ *  turns; it revises an existing plan file section-by-section instead of
+ *  replacing the document. */
+export const PLAN_UPDATE_TOOL_NAME = "propose_plan_update";
 
 /** Writer-model spec used when neither the CLI flag nor the per-project
  *  persisted override names one. */
@@ -191,6 +198,60 @@ export function planFileTarget(path: unknown): PlanFileTarget | undefined {
   return { stem, slug: slug ? slug : undefined };
 }
 
+/** Host directory name for the session-scoped `local://` root beneath the
+ *  artifacts dir (the host's `resolveLocalRoot` joins the same name). */
+const LOCAL_ROOT_DIR_NAME = "local";
+
+/** Sanitises a session id exactly as the host's `safeSessionId` does, so the
+ *  temp-dir fallback root is the same directory the host writes `local://`
+ *  files into. */
+function safeSessionId(raw: string | undefined): string {
+  const safe = (raw ?? "").replace(/[^A-Za-z0-9_.-]/g, "_");
+  return safe.length > 0 ? safe : "session";
+}
+
+/** The `<name>` of a `local://<name>` reference, or `undefined` when `path` is
+ *  not a plain session-local artifact reference: another scheme, an absolute
+ *  path, a parent-directory escape, or an empty name. */
+function localArtifactRelativePath(path: string): string | undefined {
+  const name = /^local:\/\/(.+)$/i.exec(path.trim())?.[1];
+  if (name === undefined || name === "" || name.includes("\0")) return undefined;
+  if (name.startsWith("/") || /^[A-Za-z]:/.test(name)) return undefined;
+  const parts = name.split("/");
+  if (parts.some(part => part === "." || part === "..")) return undefined;
+  return name;
+}
+
+/** Resolves a `local://<name>` path to the file on disk for `ctx`'s session, or
+ *  `undefined` when no candidate root holds it.
+ *
+ *  Mirrors the host's own resolution order — the session's artifacts dir first,
+ *  then the short root under the OS temp dir the host falls back to when no
+ *  artifacts dir is available — without importing host internals.  Never throws:
+ *  a missing artifacts dir, an unreachable root, or a rejected relative name all
+ *  degrade to "not found here", leaving the caller to report a locate failure. */
+export async function resolveLocalArtifactPath(ctx: ExtensionContext, path: string): Promise<string | undefined> {
+  const relative = localArtifactRelativePath(path);
+  if (relative === undefined) return undefined;
+
+  const artifactsDir = ctx.localProtocolOptions?.getArtifactsDir?.();
+  const sessionId = ctx.sessionManager?.getSessionId?.();
+  const roots: string[] = [];
+  if (typeof artifactsDir === "string" && artifactsDir !== "") roots.push(resolve(artifactsDir, LOCAL_ROOT_DIR_NAME));
+  roots.push(join(tmpdir(), "omp-local", safeSessionId(sessionId)));
+
+  for (const root of roots) {
+    const target = resolve(root, relative);
+    if (target !== root && !target.startsWith(root + sep)) continue;
+    try {
+      if ((await stat(target)).isFile()) return target;
+    } catch {
+      // Not in this root; the next candidate may still hold it.
+    }
+  }
+  return undefined;
+}
+
 /** Resolves the pending expansion a plan-file write should consume for `sessionKey`.
  *
  *  Tries the declared slug first (accepting a case difference between the
@@ -255,6 +316,12 @@ export interface PendingBlueprint {
    *  target path) so the savings recent-run log can name the draft.
    *  Optional: plan-mode entries omit it (the slug is already the map key). */
   slug?: string;
+  /** Estimated tokens of the sections a delegated plan update regenerated, at
+   *  ~4 characters per token.  An incremental update rewrites a few sections, so
+   *  pricing it against the whole document would overstate what the brain would
+   *  have had to emit; absent for full-document drafts, which fall back to
+   *  measuring `markdown`. */
+  deltaDocOutputTokens?: number;
 }
 
 const PENDING_STORE_KEY = "scribe-extension.pendingBlueprintStore";

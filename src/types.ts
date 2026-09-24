@@ -45,6 +45,32 @@ export interface PlanBlueprint {
   assumptions: readonly string[];
 }
 
+/** The compact delta the expensive model submits to revise an existing plan
+ *  document instead of rewriting it.
+ *
+ *  Every field names one plan section and, when supplied, is the new input for
+ *  that section; a field that is absent — and an empty array alike — means
+ *  "leave that section exactly as it is".  Section removal is expressed only
+ *  through `drop`, never by omitting a field.  `steps` reference file ids from
+ *  `files`, so the two travel together.  The extension rewrites just the named
+ *  sections with the cheap writer model and splices them into the plan file
+ *  already on disk, leaving every other section byte-identical. */
+export interface PlanUpdateBlueprint {
+  slug: string;
+  /** New input for the Context section. */
+  context?: string;
+  /** Files to add to the "Critical files & anchors" section. */
+  files?: readonly ScribeFile[];
+  /** Change steps to fold into the Approach section. */
+  steps?: readonly ScribeStep[];
+  /** Check bullets to add to the Verification section. */
+  verification?: readonly string[];
+  /** Decisions to add to the "Assumptions & contingencies" section. */
+  assumptions?: readonly string[];
+  /** Headings of sections to delete from the plan document. */
+  drop?: readonly string[];
+}
+
 /** One section in the compact document blueprint. */
 export interface DocBlueprintSection {
   heading: string;

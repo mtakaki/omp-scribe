@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import type { PlanBlueprint, ScribeOperation } from "./types";
+import type { ScribeFile, ScribeOperation, ScribeStep } from "./types";
 
 /**
  * Scribe IR resolution/validation/hydration — the counterpart to the compact
@@ -34,6 +34,25 @@ export interface HydratedScribeStep {
   snippet: string;
 }
 
+/** The two IR fields validation and resolution actually inspect.  Both the full
+ *  {@link PlanBlueprint} and a `PlanUpdateBlueprint` delta satisfy this shape, so
+ *  one validator serves the initial blueprint and the update path alike. */
+export interface ScribeIrBlueprint {
+  readonly files: readonly ScribeFile[];
+  readonly steps: readonly ScribeStep[];
+}
+
+/** What an IR submission may omit.  `requireSteps` defaults to `true`, which is
+ *  the initial-blueprint contract; the update path passes `false` so a delta
+ *  that only touches `context`/`verification`/`drop` validates without inventing
+ *  steps. */
+export interface ScribeValidationOptions {
+  /** When `false`, an empty `steps` array is valid; every other check — file
+   *  tuples, step tuples, ID cross-references, operations, range ordering, and
+   *  preserve/doNot entries — still applies. */
+  requireSteps?: boolean;
+}
+
 /** Validates `blueprint.files`/`blueprint.steps` structurally, throwing a
  *  descriptive error naming the offending step index and file id on the
  *  first violation found. Never silently repairs malformed IR.
@@ -43,7 +62,10 @@ export interface HydratedScribeStep {
  *  the sole place that checks per-position types, operation membership,
  *  range ordering, and the fileId cross-reference — not just the
  *  cross-field reference the schema genuinely cannot express. */
-export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
+export function validateScribeBlueprint(
+  blueprint: ScribeIrBlueprint,
+  options: ScribeValidationOptions = { requireSteps: true },
+): void {
   const seenIds = new Set<string>();
   blueprint.files.forEach((file, index) => {
     if (!Array.isArray(file) || file.length !== 3) {
@@ -61,7 +83,9 @@ export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
     }
   });
 
-  if (blueprint.steps.length === 0) throw new Error("steps must contain at least one step.");
+  if (blueprint.steps.length === 0 && options.requireSteps !== false) {
+    throw new Error("steps must contain at least one step.");
+  }
 
   blueprint.steps.forEach((entry, index) => {
     if (!Array.isArray(entry) || entry.length !== 6) {
@@ -106,7 +130,7 @@ export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
 
 /** Resolves file IDs to paths and assigns each step a stable `S<n>` id.
  *  Call only after {@link validateScribeBlueprint} has passed. */
-export function resolveScribeSteps(blueprint: PlanBlueprint): ScribeStepResolved[] {
+export function resolveScribeSteps(blueprint: ScribeIrBlueprint): ScribeStepResolved[] {
   const pathById = new Map(blueprint.files.map(([id, path]) => [id, path] as const));
   return blueprint.steps.map(([fileId, operation, range, intent, preserve, doNot], index) => {
     const filePath = pathById.get(fileId);

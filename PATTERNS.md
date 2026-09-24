@@ -436,6 +436,7 @@ Public export constants:
 
 ```typescript
 export const BLUEPRINT_TOOL_NAME = "propose_plan_blueprint";
+export const PLAN_UPDATE_TOOL_NAME = "propose_plan_update";
 export const DOC_BLUEPRINT_TOOL_NAME = "propose_doc_blueprint";
 export const PLACEHOLDER_CONTENT = "pending";
 export const DEFAULT_WRITER_MODEL = "@smol";
