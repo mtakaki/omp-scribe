@@ -493,7 +493,7 @@ export async function expandBlueprintToMarkdown( /* ... */ ): Promise<ExpandResu
 
 ### Interfaces & Types: PascalCase
 
-**File: `types.ts`, `scribe-ir.ts` & `config.ts`**
+**File: `types.ts`, `scribe-ir.ts`, `config.ts`, `writer-session.ts` & `literal-fidelity.ts`**
 
 ```typescript
 export type ScribeOperation = "+" | "!" | "~";
@@ -506,13 +506,16 @@ export interface DocBlueprint { /* ... */ }
 export interface ScribeStepResolved { /* ... */ }   // scribe-ir.ts
 export interface HydratedScribeStep { /* ... */ }   // scribe-ir.ts
 export interface ScribeConfig { /* ... */ }         // config.ts
-export type ExpandResult = { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number } | { error: string };
+export interface ExpandSuccess { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number; fidelity?: FidelityReport };  // writer-session.ts
+export type ExpandResult = ExpandSuccess | { error: string };  // writer-session.ts
+export interface FidelityTarget { heading: string; literals: readonly string[] };  // literal-fidelity.ts
+export interface FidelityReport { checked: number; repaired: boolean; missing: string[]; missingSections: string[]; gaps: FidelityGap[] };  // literal-fidelity.ts
 ```
 
 **Pattern:**
 - Interfaces are PascalCase (domain types)
 - Type aliases are PascalCase, covering both the positional Scribe IR tuples and discriminated unions
-- Suffix interfaces with the domain noun: `...Blueprint`, `...Config`, `...Step`, `...Range`
+- Suffix interfaces with the domain noun: `...Blueprint`, `...Config`, `...Step`, `...Range`, `...Report`, `...Target`
 
 ### Variables: camelCase, Descriptive Nouns
 
@@ -1134,6 +1137,32 @@ blueprint.steps.forEach((entry, index) => {
 - Cross-field checks the schema genuinely cannot express (does this `fileId` appear in `files`? is this `range` inverted?) live here, which is why `resolveScribeSteps()` is documented as call-after-validate
 - `expandBlueprintToMarkdown` catches the throw and returns it as `{ error }`, preserving the module's "errors are return values" contract
 
+### Literal Fidelity: Machine-Checked Post-Condition
+
+**File: `literal-fidelity.ts` & `writer-session.ts`**
+
+The literals a brief carries are a contract the cheap writer honors only probabilistically, so the draft is verified against the brief and repaired within a bounded budget instead of trusted:
+
+```typescript
+let report = checkFidelity(targets, splitPlanSections(markdown).sections);
+let rounds = 0;
+while (report.missing.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
+  rounds += 1;
+  const repaired = await runWriterExpansionWithRetry(pi, ctx, writerModel, PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT, buildRepairPromptText(report.gaps, targets, current));
+  if ("error" in repaired) break;
+  markdown = splicePlanSections(markdown, replacementsFor(repaired, report.gaps));  // flagged headings only
+  report = checkFidelity(targets, splitPlanSections(markdown).sections);
+}
+return { ...expansion, markdown, usage: accumulated, costUsd, fidelity: { ...report, repaired: rounds > 0 } };
+```
+
+**Pattern:**
+- Post-conditions are verified rather than assumed: the literals come from the brief input, never from what the draft claims to cover
+- Repair is bounded (`MAX_FIDELITY_REPAIR_ROUNDS`; `0` degrades to report-only) and reports its residue instead of throwing, so a usable draft is never lost to an unfixable gap
+- Only the flagged sections are spliced back, so a repair response cannot rewrite a section the gate did not name
+- A target section the draft never emitted is reported through `missingSections`, never inserted — inserting one would change the plan, and the update path's unrendered-heading rejection owns that decision
+- Matching is whitespace-normalized and the extractor is conservative by design: a missed literal costs one guarantee, a false positive costs a session on every plan
+
 ---
 
 ## Summary: Design Principles
@@ -1150,7 +1179,7 @@ blueprint.steps.forEach((entry, index) => {
 
 6. **Events: Declarative binding, closure capture for state.** All handlers registered in factory; shared state via module variables.
 
-7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, and tool schemas all prevent invalid states, and `validateScribeBlueprint` now enforces the per-field Scribe IR contract that a single regex previously covered only partially.
+7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, and tool schemas all prevent invalid states, `validateScribeBlueprint` enforces the per-field Scribe IR contract that a single regex previously covered only partially, and the literal-fidelity gate verifies the writer's draft against the brief's literals and repairs the sections that lost one within a bounded budget.
 
 8. **Injection: Host provides SDK singletons via `pi` namespace.** Never import the SDK directly; use injected `pi` to access live singletons.
 

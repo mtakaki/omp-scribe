@@ -2100,3 +2100,105 @@ describe("scribe: /scribe-model command", () => {
     expect(second.notifications.some(n => n.message.includes("writer: anthropic/claude-haiku-3-5"))).toBe(true);
   });
 });
+
+// ─── Literal-fidelity reporting at the tool boundary ──────────────────────────
+
+describe("scribe: literal fidelity reporting", () => {
+  /** A draft that keeps the blueprint's only literal, in both sections it
+   *  supplies. */
+  const COMPLIANT_DRAFT = `# Fixture Plan
+
+## Context
+
+Context sentence.
+
+## Approach
+
+- Modify \`src/example.ts\` to update the example export.
+
+## Critical files & anchors
+
+- \`src/example.ts\` — example file
+`;
+
+  /** The same draft with the path paraphrased away. */
+  const LOSSY_DRAFT = `# Fixture Plan
+
+## Context
+
+Context sentence.
+
+## Approach
+
+- Update the example export.
+`;
+
+  function makeBlueprint(slug: string) {
+    return {
+      slug,
+      title: "Fixture Plan",
+      context: "Context sentence.",
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
+      verification: ["bun test"],
+      assumptions: [],
+    };
+  }
+
+  it("reports verified verbatim in the result text and the report in details", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(COMPLIANT_DRAFT));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-fidelity-ok",
+      makeBlueprint("fidelity-compliant"),
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("verified verbatim");
+    const details = result["details"] as { fidelity?: { checked: number; missing: string[]; repaired: boolean } };
+    expect(details.fidelity?.missing).toEqual([]);
+    expect(details.fidelity?.repaired).toBe(false);
+    expect(details.fidelity?.checked).toBe(1);
+  });
+
+  it("names a literal the writer dropped and points at the update tool instead of claiming fidelity", async () => {
+    const { fakeSdk, queueScripts, setScript } = createFakeSdk();
+    const lossy = successScript(LOSSY_DRAFT);
+    setScript(lossy);
+    // One draft plus the gate's bounded repair rounds.
+    queueScripts(lossy, lossy, lossy);
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-fidelity-lossy",
+      makeBlueprint("fidelity-lossy"),
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("`src/example.ts`");
+    expect(text).toContain(PLAN_UPDATE_TOOL_NAME);
+    expect(text).not.toContain("verified verbatim");
+    const details = result["details"] as { fidelity?: { missing: string[] } };
+    expect(details.fidelity?.missing).toEqual(["src/example.ts"]);
+
+    // The un-repaired draft is what the write swap would finalize.
+    const entry = pendingMarkdownStore().get("fidelity-lossy");
+    expect(entry?.markdown).toContain("## Approach");
+    expect(entry?.markdown).not.toContain("src/example.ts");
+  });
+});

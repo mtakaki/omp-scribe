@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DocBlueprint, PlanBlueprint } from "../src/types";
-import { DOC_WRITER_SYSTEM_PROMPT, expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "../src/writer-session";
+import {
+  DOC_WRITER_SYSTEM_PROMPT,
+  expandBlueprintToMarkdown,
+  expandDocBlueprintToMarkdown,
+  expandPlanUpdateToMarkdown,
+} from "../src/writer-session";
+import { splitPlanSections } from "../src/plan-sections";
 import { createFakeExtensionContext, createFakeExtensionApi, injectSdk } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeAgentSession, type FakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
@@ -16,6 +22,62 @@ const BLUEPRINT: PlanBlueprint = {
   verification: ["bun test passes"],
   assumptions: [],
 };
+
+/** A blueprint whose step intent names two literals — a path and a backticked
+ *  identifier — so the drafts below can drop one and give the gate something to
+ *  repair. */
+const LOSSY_BLUEPRINT: PlanBlueprint = {
+  slug: "lossy-plan",
+  title: "Lossy Plan",
+  context: "A lossy context sentence.",
+  files: [["L", "src/lossy.ts", "lossy file"]],
+  steps: [["L", "~", [1, 2], "Rename the helper to `deriveVariantKey` in src/lossy.ts.", [], []]],
+  verification: [],
+  assumptions: [],
+};
+
+/** The draft a paraphrasing writer returns for {@link LOSSY_BLUEPRINT}: it
+ *  keeps the path and loses the identifier.  `## Context` follows `## Approach`
+ *  so each section's raw slice ends with the blank line a splice reproduces
+ *  byte-for-byte — which is what makes "the untouched section is untouched"
+ *  testable. */
+const LOSSY_DRAFT = `# Lossy Plan
+
+## Context
+
+A lossy context sentence.
+
+## Approach
+
+- Update src/lossy.ts to rename the helper.
+
+## Verification
+
+- \`bun test\` passes.
+`;
+
+/** The repair response that restores the dropped identifier. */
+const REPAIRED_APPROACH = `## Approach
+
+- Rename the helper to \`deriveVariantKey\` in src/lossy.ts.
+`;
+
+/** {@link LOSSY_DRAFT} with the dropped identifier appended as a literal-only
+ *  line — the shape that satisfies a literal check without stating anything,
+ *  which the gate must strip from a draft and refuse from a repair. */
+const DUMPED_DRAFT = LOSSY_DRAFT.replace(
+  "- Update src/lossy.ts to rename the helper.\n",
+  "- Update src/lossy.ts to rename the helper.\n- `deriveVariantKey`\n",
+);
+
+/** The `## Verification` section a compliant update writer returns for the delta
+ *  used in the update-path case below: the delta's bullet, plus the one already
+ *  on the plan. */
+const REPAIRED_VERIFICATION = `## Verification
+
+- \`bun test tests/auth.test.ts\` passes
+- \`bun test tests/auth-refresh.test.ts\` passes
+`;
 
 function successScript(text: string): FakeSessionEvent[] {
   return [
@@ -288,6 +350,39 @@ describe("expandBlueprintToMarkdown", () => {
     }
   });
 
+  it("prints each file's operation in the FILES block, from the steps that reference it", async () => {
+    const { fakeSdk, setScript, lastSession } = createFakeSdk();
+    setScript(successScript("# Operation Plan\n\nOK."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const blueprint: PlanBlueprint = {
+      slug: "operation-plan",
+      title: "Operation Plan",
+      context: "Touch two files and name a third.",
+      files: [
+        ["E", "src/example.ts", "modified file"],
+        ["N", "src/new.ts", "brand-new module"],
+        ["P", "src/plain.ts", "referenced by no step"],
+      ],
+      steps: [
+        ["E", "~", [1, 2], "Update the example export.", [], []],
+        ["N", "+", null, "Author the new module.", [], []],
+      ],
+      verification: [],
+      assumptions: [],
+    };
+
+    await expandBlueprintToMarkdown(pi, ctx, "@smol", blueprint);
+    const prompt = lastSession()!.lastPrompt ?? "";
+
+    expect(prompt).toContain("- src/example.ts — modify — modified file");
+    expect(prompt).toContain("- src/new.ts — add (new file) — brand-new module");
+    // A file no step references has no operation to state.
+    expect(prompt).toContain("- src/plain.ts — referenced by no step");
+  });
+
   it("does not resolve if agent_end has isTerminal:false", async () => {
     const { fakeSdk, setScript } = createFakeSdk();
     // isTerminal:false should be ignored; only the terminal agent_end resolves the promise.
@@ -309,6 +404,161 @@ describe("expandBlueprintToMarkdown", () => {
     if (!("markdown" in result)) throw new Error("Expected markdown");
     // Both deltas should be accumulated (fake runs all events synchronously in prompt())
     expect(result.markdown).toBe("Part1 Part2");
+  });
+});
+
+// ─── Literal fidelity ─────────────────────────────────────────────────────────
+
+describe("literal fidelity", () => {
+  it("repairs a lossy draft, splices only the flagged section, and accumulates usage", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    // The shared script is the compliant one, so a third session (which would
+    // mean the gate ran a round it should not have) cannot hang the test.
+    setScript(successScript(REPAIRED_APPROACH));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(REPAIRED_APPROACH));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.checked).toBe(2);
+    expect(result.markdown).toContain("`deriveVariantKey`");
+    // The gate only splices what it flagged: every other section keeps its bytes.
+    const [draftContext, repairedContext] = [LOSSY_DRAFT, result.markdown].map(
+      text => splitPlanSections(text).sections.find(section => section.heading === "Context")?.text,
+    );
+    expect(repairedContext).toBe(draftContext);
+    // The repair session's tokens and dollars are added, never reset.
+    expect(result.usage.input).toBe(200);
+    expect(result.usage.output).toBe(100);
+    expect(result.costUsd).toBeCloseTo(0.018, 8);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("strips a literal-only line from the draft before judging it", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    // The dump is what every session returns, so the repair cannot close the gap.
+    setScript(successScript(DUMPED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The chip is gone, so the identifier counts as lost rather than carried.
+    expect(result.markdown).not.toContain("- `deriveVariantKey`");
+    expect(result.markdown).toContain("- Update src/lossy.ts to rename the helper.");
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("refuses a repair that answers with a literal-only line", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DUMPED_DRAFT));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(DUMPED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The dump is never spliced: the plan keeps the draft's own prose, and the
+    // round that changed nothing ends the loop.
+    expect(result.markdown).toBe(LOSSY_DRAFT.trimEnd());
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("reports the repair outcome once, after the last round", async () => {
+    const { fakeSdk, queueScripts, setScript } = createFakeSdk();
+    setScript(successScript(REPAIRED_APPROACH));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(REPAIRED_APPROACH));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx, notifications } = createFakeExtensionContext({ hasUI: true });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual([]);
+    const restored = notifications.filter(n => n.message.includes("restored them verbatim"));
+    expect(restored).toHaveLength(1);
+    expect(restored[0]!.message).toContain("dropped 1 load-bearing literal");
+    // The pre-repair warning is gone: the gate reports the outcome, not a plan.
+    expect(notifications.some(n => n.message.includes("paraphrased"))).toBe(false);
+  });
+
+  it("reports the residue and keeps the draft when the repair rounds stay lossy", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    const lossy = successScript(LOSSY_DRAFT);
+    setScript(lossy);
+    // One initial draft plus one repair that splices its own unchanged section,
+    // which is what ends the loop.
+    queueScripts(lossy, lossy);
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    // The writer's response is trimmed before use, so the draft under discussion
+    // is the trimmed text; the section the gate could not fix is still byte-for-
+    // byte the section it started with.
+    expect(result.markdown).toBe(LOSSY_DRAFT.trimEnd());
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("spends no repair session when the draft keeps every literal", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(LOSSY_DRAFT.replace("- Update src/lossy.ts to rename the helper.", "- Rename the helper to `deriveVariantKey` in src/lossy.ts.")));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.checked).toBeGreaterThan(0);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.fidelity?.missingSections).toEqual(["Critical files & anchors"]);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("rewrites a delta's section again when the writer drops one of the delta's literals", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    const lossy = successScript("## Verification\n\n- The refresh tests pass.\n");
+    setScript(lossy);
+    queueScripts(lossy, successScript(REPAIRED_VERIFICATION));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandPlanUpdateToMarkdown(
+      pi,
+      ctx,
+      "@smol",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      splitPlanSections("## Verification\n\n- `bun test tests/auth.test.ts` passes\n"),
+    );
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.markdown).toContain("`bun test tests/auth-refresh.test.ts`");
+    expect(sessionCount()).toBe(2);
   });
 });
 

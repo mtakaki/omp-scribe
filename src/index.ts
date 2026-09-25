@@ -38,6 +38,7 @@ import {
   planUpdateDrops,
   planUpdateHeadings,
 } from "./writer-session";
+import type { FidelityReport } from "./literal-fidelity";
 import { computeCosts } from "./pricing";
 import {
   appendBlueprintFailure,
@@ -57,15 +58,16 @@ Cost control is active for this plan turn. Do NOT compose the Markdown plan docu
    - \`fileId\` — must match an id in \`files\`.
    - \`operation\` — "+" add, "!" delete, "~" modify.
    - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
-   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
+   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation, but name every load-bearing literal the change depends on — an identifier, path, command, expression, or constant — verbatim and in backticks, because the writer model must reproduce each one character-for-character.
    - \`preserve\` — array of things that must keep working; empty array when none.
    - \`doNot\` — array of explicit prohibitions; empty array when none.
    - Exactly six elements per step — no extra notes, rationale, or constraints slots.
    Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
    Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
-3. To record a refinement after the plan file exists, do NOT rewrite the plan yourself and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug plus ONLY the fields that changed — \`context\`, \`files\` (together with \`steps\`, since every step references a file id), \`verification\`, \`assumptions\` — and optionally \`drop\`, a list of section headings to delete. Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`. The extension rewrites just those sections and splices them into the existing file; every section you did not name stays byte-identical. Omit a field to leave its section untouched, and use this instead of a second blueprint call as often as the plan needs refining.
-4. Then continue the normal \`xd://propose\` submission with that slug, as usual.
+3. The tool result reports literal fidelity: either "verified verbatim" or the exact literals the draft lost. Treat it as machine-checked evidence and do NOT re-read the plan file to re-verify the draft, and do NOT re-check it against your blueprint. If it still lists missing literals after the repair pass, record that gap with \`${PLAN_UPDATE_TOOL_NAME}\` (or state it in your reply) instead of reading the file back.
+4. To record a refinement after the plan file exists, do NOT rewrite the plan yourself and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug plus ONLY the fields that changed — \`context\`, \`files\` (together with \`steps\`, since every step references a file id), \`verification\`, \`assumptions\` — and optionally \`drop\`, a list of section headings to delete. Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`. The extension rewrites just those sections and splices them into the existing file; every section you did not name stays byte-identical. Omit a field to leave its section untouched, and use this instead of a second blueprint call as often as the plan needs refining.
+5. Then continue the normal \`xd://propose\` submission with that slug, as usual.
 Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>`;
 
@@ -75,6 +77,44 @@ Doc-blueprint mode is active for this document. Do NOT compose the full Markdown
 2. After it returns, call \`write\` with the exact path you declared in the blueprint and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes.
 Never draft the Markdown document body yourself, at any point in this turn. If \`${DOC_BLUEPRINT_TOOL_NAME}\` reports a failure, write the document yourself with \`write\` and continue — never the placeholder word.
 </scribe-doc>`;
+
+/** Missing literals the fidelity line names before summarizing the tail: the
+ *  brain needs enough to see what the writer dropped, not a transcript. */
+const MAX_REPORTED_MISSING_LITERALS = 8;
+
+/**
+ * The literal-fidelity sentence appended to a plan tool result: what the gate
+ * verified, or which literals the draft lost and how to record the gap.
+ *
+ * Returns "" when the path produced no report (doc mode), so callers can append
+ * the result unconditionally.  Each missing literal is named once, and the
+ * sentence tells the brain not to re-read the plan file — that re-read plus the
+ * `propose_plan_update` it triggers is the cost the gate exists to remove.
+ */
+function formatFidelityLine(fidelity: FidelityReport | undefined): string {
+  if (fidelity === undefined) return "";
+
+  const missing = [...new Set(fidelity.missing)];
+  const parts: string[] = [];
+  if (missing.length === 0) {
+    const verified = fidelity.checked === 1 ? "is" : "are";
+    parts.push(
+      fidelity.checked === 0
+        ? "Literal fidelity: the draft carries no section to check the brief's literals against."
+        : `Literal fidelity: all ${fidelity.checked} load-bearing literal${fidelity.checked === 1 ? "" : "s"} the brief supplies ${verified} verified verbatim in the draft.`,
+    );
+  } else {
+    const shown = missing.slice(0, MAX_REPORTED_MISSING_LITERALS).map(literal => `\`${literal}\``).join(", ");
+    const more = missing.length - MAX_REPORTED_MISSING_LITERALS;
+    parts.push(
+      `Literal fidelity: the draft is missing ${missing.length} load-bearing literal${missing.length === 1 ? "" : "s"}: ${shown}${more > 0 ? ` and ${more} more` : ""}. Do not re-read the plan file to verify it; record the gap with ${PLAN_UPDATE_TOOL_NAME} before proposing.`,
+    );
+  }
+  if (fidelity.missingSections.length > 0) {
+    parts.push(`The draft has no ${fidelity.missingSections.join(", ")} section, so the literals it supplies were not checked.`);
+  }
+  return parts.join(" ");
+}
 
 /** Footer status key holding the Scribe line; cleared on session shutdown. */
 const STATUS_KEY = "scribe";
@@ -93,6 +133,13 @@ const SCRIBE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDATE_T
 
 /** Tools that exist only on plan-mode turns, activated and deactivated together. */
 const PLAN_MODE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDATE_TOOL_NAME];
+
+/** Appended to both plan tools' `steps` description.  The literal-fidelity gate
+ *  can only verify literals a step names, and the writer can only reproduce
+ *  what it is handed verbatim, so a literal left implicit in the intent's prose
+ *  may legitimately be paraphrased away. */
+const STEP_LITERAL_REQUIREMENT =
+  "Spell every load-bearing literal this step relies on — identifier, path, expression, command, or constant — verbatim inside its intent, preserve, or doNot strings: the writer model must reproduce each character-for-character, and a literal left implicit in prose may be paraphrased.";
 
 /** Writer identity recorded for a draft the extension produces itself: a
  *  drop-only plan update deletes sections and regenerates none, so no writer
@@ -219,7 +266,7 @@ export default function scribe(pi: ExtensionAPI): void {
         .array(z.array(z.unknown()).min(6).max(6))
         .min(1)
         .describe(
-          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exactly six elements — no extra notes, rationale, or constraints slots. Exact shape enforced when the blueprint tool runs.`,
+          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exactly six elements — no extra notes, rationale, or constraints slots. Exact shape enforced when the blueprint tool runs. ${STEP_LITERAL_REQUIREMENT}`,
         ),
       verification: z
         .array(z.string())
@@ -273,14 +320,25 @@ export default function scribe(pi: ExtensionAPI): void {
         draft: { model: `${result.model.provider}/${result.model.id}`, chars: result.markdown.length },
       });
 
+      const fidelityLine = formatFidelityLine(result.fidelity);
       return {
         content: [
           {
             type: "text",
-            text: `Blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "local://${blueprint.slug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${blueprint.slug}".`,
+            text: [
+              `Blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "local://${blueprint.slug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${blueprint.slug}".`,
+              fidelityLine,
+            ]
+              .filter(part => part !== "")
+              .join(" "),
           },
         ],
-        details: { slug: blueprint.slug, markdownChars: result.markdown.length, writerModel: `${result.model.provider}/${result.model.id}` },
+        details: {
+          slug: blueprint.slug,
+          markdownChars: result.markdown.length,
+          writerModel: `${result.model.provider}/${result.model.id}`,
+          fidelity: result.fidelity,
+        },
       };
     },
   });
@@ -310,7 +368,7 @@ export default function scribe(pi: ExtensionAPI): void {
         .array(z.array(z.unknown()).min(6).max(6))
         .optional()
         .describe(
-          `Change steps to fold into the Approach section, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array; requires files in the same call. Exact shape enforced when the tool runs.`,
+          `Change steps to fold into the Approach section, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array; requires files in the same call. Exact shape enforced when the tool runs. ${STEP_LITERAL_REQUIREMENT}`,
         ),
       verification: z
         .array(z.string())
@@ -466,11 +524,17 @@ export default function scribe(pi: ExtensionAPI): void {
         draft: { model: `${result.model.provider}/${result.model.id}`, chars: spliced.length },
       });
 
+      const fidelityLine = formatFidelityLine(result.fidelity);
       return {
         content: [
           {
             type: "text",
-            text: `Plan update accepted: ${headings.join(", ")} rewritten by "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model) and spliced into local://${writeSlug}-plan.md (${spliced.length} chars). Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
+            text: [
+              `Plan update accepted: ${headings.join(", ")} rewritten by "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model) and spliced into local://${writeSlug}-plan.md (${spliced.length} chars). Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
+              fidelityLine,
+            ]
+              .filter(part => part !== "")
+              .join(" "),
           },
         ],
         details: {
@@ -479,6 +543,7 @@ export default function scribe(pi: ExtensionAPI): void {
           dropped: drops,
           markdownChars: spliced.length,
           writerModel: `${result.model.provider}/${result.model.id}`,
+          fidelity: result.fidelity,
         },
       };
     },

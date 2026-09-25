@@ -16,9 +16,9 @@ The extension transparently swaps the cheap-model output before the native `writ
 
 1. **On plan-mode turn**: Extension activates `propose_plan_blueprint` and `propose_plan_update` together and injects the `<scribe>` directive.
 2. **Expensive model**: Calls `propose_plan_blueprint` with compact JSON metadata plus the Scribe IR `files`/`steps` tuples; calls `write` with placeholder `"pending"`.
-3. **Tool handler**: Validates and resolves that IR, hydrates each step's referenced line range from disk, then spawns a nested cheap-model session to expand the resulting plain-text brief into Markdown; caches result under the blueprint slug.
+3. **Tool handler**: Validates and resolves that IR, hydrates each step's referenced line range from disk, then spawns a nested cheap-model session to expand the resulting plain-text brief into Markdown; checks that every load-bearing literal the brief supplies survived verbatim and asks the writer to re-emit any section that lost one (bounded rounds); caches result under the blueprint slug.
 4. **Write interception**: Extension intercepts the `write` call, swaps placeholder for cached Markdown, then native write tool executes.
-5. **Refinement**: For a later change the expensive model calls `propose_plan_update` with only the fields that changed (plus optional `drop` headings) and `write`s the placeholder again; the cheap model rewrites just those sections against the plan text read from disk or the newest pending draft, and the extension splices them in.
+5. **Refinement**: For a later change the expensive model calls `propose_plan_update` with only the fields that changed (plus optional `drop` headings) and `write`s the placeholder again; the cheap model rewrites just those sections against the plan text read from disk or the newest pending draft, the same literal check runs on the sections it rewrote, and the extension splices them in.
 6. **Result**: Expensive model token footprint drops from ~2500 tokens to ~7 bytes (the placeholder) per plan write, and to a compact delta JSON per refinement.
 
 ---
@@ -31,10 +31,11 @@ The extension transparently swaps the cheap-model output before the native `writ
 |--------|---------|-------------|-------|
 | `src/types.ts` | Compact blueprint shapes shared between expensive and cheap models | `ScribeFile`, `ScribeStep`, `PlanBlueprint`, `PlanUpdateBlueprint`, `DocBlueprint`, `DocBlueprintSection` | 91 |
 | `src/scribe-ir.ts` | Scribe IR validation, file-id resolution, and line-range hydration from disk | `validateScribeBlueprint()`, `resolveScribeSteps()`, `hydrateScribeStep()`, `ScribeIrBlueprint`, `HydratedScribeStep` | 200 |
-| `src/plan-sections.ts` | Pure plan-document section surgery: split, splice replacements, drop sections | `PLAN_SECTIONS`, `CANONICAL_PLAN_SECTIONS`, `splitPlanSections()`, `splicePlanSections()`, `planHeadingKey()`, `scanPlanHeadings()` | 181 |
-| `src/config.ts` | Flags, plan-mode detection, plan-file resolution, `local://` artifact resolution, oh-my-pi contracts, persisted per-project writer-model config, footer-status formatter, process-wide draft stores | `isPlanModeActive()`, `isPlanModeBranch()`, `planFileTarget()`, `pendingPlanEntry()`, `resolveLocalArtifactPath()`, `readScribeConfig()`, `registerScribeFlags()`, `readPersistedScribeConfig()`, `writePersistedScribeConfig()`, `formatScribeStatus()`, `pendingMarkdownStore()`, `PendingBlueprint` | 471 |
-| `src/writer-session.ts` | Nested session spawning; cheap-model expansion engine; Scribe IR hydration; plan-section rewrites | `expandBlueprintToMarkdown()`, `expandPlanUpdateToMarkdown()`, `expandDocBlueprintToMarkdown()`, `buildPlanPromptText()`, `buildPlanUpdatePromptText()`, `planUpdateHeadings()`, `planUpdateDrops()`, `deltaSupplies()`, `ExpandResult` type, `WRITER_SYSTEM_PROMPT`, `PLAN_UPDATE_WRITER_SYSTEM_PROMPT`, `DOC_WRITER_SYSTEM_PROMPT` | 448 |
-| `src/index.ts` | Extension factory; lifecycle events, tool registration, footer-status wiring, state management, write-content swap | Default export `scribe(pi: ExtensionAPI)` | 902 |
+|`src/plan-sections.ts`|Pure plan-document section surgery: split, splice replacements, drop sections|`PLAN_SECTIONS`, `CANONICAL_PLAN_SECTIONS`, `splitPlanSections()`, `splicePlanSections()`, `planHeadingKey()`, `scanPlanHeadings()`|181|
+|`src/literal-fidelity.ts`|Pure literal-fidelity gate: extract the load-bearing literals a brief supplies, strip literal-only lines, report which ones a draft lost, render the repair brief and its system prompt|`extractLiterals()`, `normalizeForMatch()`, `findMissingLiterals()`, `checkFidelity()`, `buildRepairPromptText()`, `literalDumpLines()`, `removeLiteralDumpLines()`, `PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT`, `FidelityTarget`, `RepairTarget`, `FidelityGap`, `FidelityReport`|287|
+|`src/config.ts`|Flags, plan-mode detection, plan-file resolution, `local://` artifact resolution, oh-my-pi contracts, persisted per-project writer-model config, footer-status formatter, process-wide draft stores|`isPlanModeActive()`, `isPlanModeBranch()`, `planFileTarget()`, `pendingPlanEntry()`, `resolveLocalArtifactPath()`, `readScribeConfig()`, `registerScribeFlags()`, `readPersistedScribeConfig()`, `writePersistedScribeConfig()`, `formatScribeStatus()`, `pendingMarkdownStore()`, `PendingBlueprint`|471|
+|`src/writer-session.ts`|Nested session spawning; cheap-model expansion engine; Scribe IR hydration; plan-section rewrites; literal-fidelity gate on both plan paths|`expandBlueprintToMarkdown()`, `expandPlanUpdateToMarkdown()`, `expandDocBlueprintToMarkdown()`, `buildPlanPromptText()`, `buildPlanUpdatePromptText()`, `planUpdateHeadings()`, `planUpdateDrops()`, `deltaSupplies()`, `ExpandSuccess`, `ExpandResult` type, `MAX_FIDELITY_REPAIR_ROUNDS`, `WRITER_SYSTEM_PROMPT`, `PLAN_UPDATE_WRITER_SYSTEM_PROMPT`, `DOC_WRITER_SYSTEM_PROMPT`|640|
+|`src/index.ts`|Extension factory; lifecycle events, tool registration, footer-status wiring, state management, write-content swap, literal-fidelity reporting|Default export `scribe(pi: ExtensionAPI)`|966|
 
 ### Data Flow
 
@@ -56,8 +57,10 @@ Expensive model reads system prompt
     │    ├─ Build labeled plain-text brief with buildPlanPromptText()
     │    ├─ Send prompt text to cheap writer model via session.prompt()
     │    ├─ Collect expanded Markdown via session.subscribe()
+    │    ├─ enforceLiteralFidelity(): planFidelityTargets() then checkFidelity() on the draft; each round briefs the writer with buildRepairPromptText() and splices the repaired sections in place (≤ MAX_FIDELITY_REPAIR_ROUNDS rounds, usage/cost accumulated)
+    │    ├─ Attach the FidelityReport (checked / missing / missingSections) to the expansion
     │    ├─ Store in pendingMarkdownStore()[slug] as PendingBlueprint { sessionKey, markdown, … }
-    │    └─ Return success message
+    │    └─ Return success message plus the fidelity line (verified count, or the unverified literals with a pointer at propose_plan_update)
     │
     ├─ Calls write with path=local://<slug>-plan.md, content="pending"
     │    ↓
@@ -80,6 +83,7 @@ Expensive model reads system prompt
     │    ├─ Reject a delta with no changes, or steps arriving without their files
     │    ├─ expandPlanUpdateToMarkdown(): validate + hydrate the delta's steps, then brief the writer
     │    │    with each requested section's current text plus the delta (buildPlanUpdatePromptText)
+    │    ├─ enforceLiteralFidelity() over the delta's own literals, so a section that lost one is repaired before the caller parses headings
     │    ├─ Require the writer to return every requested heading, else fail leaving the store empty
     │    ├─ splicePlanSections(currentText, replacements, drops) → unnamed sections keep their exact bytes
     │    ├─ Store in pendingMarkdownStore()[slug] with deltaDocOutputTokens
@@ -111,8 +115,8 @@ Expensive model reads system prompt
 | `session_start` | `cfg = await readScribeConfig(pi, ctx.cwd)`; model list captured; footer set to idle/doc-armed/plan |
 | `before_agent_start` (plan branch) | Plan tools (`propose_plan_blueprint`, `propose_plan_update`) activated together; `<scribe>` directive injected; footer set to `● plan` |
 | `before_agent_start` (non-plan branch) | Plan tools deactivated; no directive; footer set to idle/doc-armed |
-| Blueprint tool execute | Footer gains the draft: `● plan — <n> chars drafted (writer: <provider/id>)`, or `✗ … expansion failed — <reason>` |
-| Update tool execute | Same draft footer; a drop-only delta needs no writer session and records the `scribe/splice` identity with zero writer tokens |
+| Blueprint tool execute | Footer gains the draft: `● plan — <n> chars drafted (writer: <provider/id>)`, or `✗ … expansion failed — <reason>`. The result text and `details.fidelity` then carry the literal-fidelity line: the verified literal count, or the unverified literals with a pointer at `propose_plan_update` (and any section the draft never emitted) |
+| Update tool execute | Same draft footer; a drop-only delta needs no writer session and records the `scribe/splice` identity with zero writer tokens. The result carries the same literal-fidelity line for the sections the delta rewrote |
 | `tool_call` (write to a plan file with a pending draft) | Content swapped; store entry deleted; footer returns to its mode-only state |
 | `session_shutdown` | Store entries whose `sessionKey` matches current session deleted; footer cleared |
 | `/scribe-model` | Resolves and persists the chosen writer model (or clears it on `reset`), then refreshes the footer |
@@ -131,6 +135,7 @@ All footer writes go through `ctx.ui.setStatus("scribe", …)` and are skipped w
 │   ├── writer-session.ts     # Nested session spawning; expansion and section-rewrite logic
 │   ├── scribe-ir.ts          # Scribe IR validation, resolution, and line-range hydration
 │   ├── plan-sections.ts      # Pure plan-document section split/splice engine
+│   ├── literal-fidelity.ts   # Pure literal extraction, gap check, and repair brief
 │   ├── stats-store.ts        # Savings JSON read/append + /savings dashboard
 │   ├── pricing.ts            # Dual-model cost math + @plan-role baseline fallback
 │   └── types.ts              # Core domain types (PlanBlueprint, PlanUpdateBlueprint, DocBlueprint)
@@ -141,6 +146,7 @@ All footer writes go through `ctx.ui.setStatus("scribe", …)` and are skipped w
 │   ├── writer-session.js
 │   ├── scribe-ir.js
 │   ├── plan-sections.js
+│   ├── literal-fidelity.js
 │   └── types.js
 ├── package.json              # Manifest; declares devDependencies, build scripts, omp config
 ├── tsconfig.json             # TypeScript compiler settings (ES2022, ESNext, strict)
@@ -357,8 +363,11 @@ Three hardcoded assumptions about oh-my-pi's internals (documented in `config.ts
 ### Plan Sections
 - **`src/plan-sections.ts`** — Pure text engine for delegated plan updates: `splitPlanSections()` (fence-aware `##` splitter whose chunks concatenate back to the input byte-for-byte), `splicePlanSections()` (replace in place, insert at the canonical position, append unknown headings, delete dropped ones, and keep every unnamed section verbatim), plus `PLAN_SECTIONS`/`CANONICAL_PLAN_SECTIONS`. It reads no files and imports no host APIs. Update `PLAN_SECTIONS` if the plan-document section names or order change; if the heading level changes, update the section regex too.
 
+### Literal Fidelity
+- **`src/literal-fidelity.ts`** — Pure text engine for the fidelity gate: `extractLiterals()` mines the load-bearing literals out of brief text, `findMissingLiterals()`/`checkFidelity()` report which ones a draft lost and which target sections it never emitted, and `buildRepairPromptText()` plus `PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT` render the repair brief. It reads no files and imports no host APIs. Tune the extraction patterns and the shape filters here when a real draft loses a literal the extractor never collected.
+
 ### Expansion Engine
-- **`src/writer-session.ts`** — Nested session spawning, plan-mode Scribe IR hydration plus plain-text brief assembly, plan-section rewrites, and doc-mode JSON expansion. Only place where `sdk.createAgentSession()` is called. If writer-model behavior needs tuning, edit `WRITER_SYSTEM_PROMPT` / `PLAN_UPDATE_WRITER_SYSTEM_PROMPT` / `DOC_WRITER_SYSTEM_PROMPT` here.
+- **`src/writer-session.ts`** — Nested session spawning, plan-mode Scribe IR hydration plus plain-text brief assembly, plan-section rewrites, doc-mode JSON expansion, and the literal-fidelity gate (`enforceLiteralFidelity()`, `MAX_FIDELITY_REPAIR_ROUNDS`, `fidelitySources()`) that both plan paths run their draft through. Only place where `sdk.createAgentSession()` is called. If writer-model behavior needs tuning, edit `WRITER_SYSTEM_PROMPT` / `PLAN_UPDATE_WRITER_SYSTEM_PROMPT` / `DOC_WRITER_SYSTEM_PROMPT` here.
 
 ### Type Definitions
 - **`src/types.ts`** — Core domain types. Plan-mode steps are positional tuples validated by `src/scribe-ir.ts`; `PlanUpdateBlueprint` is the incremental delta `propose_plan_update` accepts; the doc-mode outline is shared between expensive and cheap models via JSON serialization.
@@ -412,6 +421,7 @@ Three hardcoded assumptions about oh-my-pi's internals (documented in `config.ts
    Verify:
    - the footer reads `Scribe ○ idle (writer: …)` at session start and `Scribe ● plan (writer: …)` once plan mode is on
    - both `propose_plan_blueprint` and `propose_plan_update` are offered and the blueprint tool accepts a compact payload with Scribe IR `files`/`steps` tuples
+   - the `propose_plan_blueprint` result text ends with the literal-fidelity line — `all <n> load-bearing literals the brief supplies are verified verbatim in the draft`, or the unverified literals in backticks with a pointer at `propose_plan_update` — and the transcript shows no plan-file `Read` and no `propose_plan_update` call between that result and the `write`
    - the footer then reads `Scribe ● plan — <n> chars drafted (writer: <provider/id>)`, reverting to the mode-only line after the `write` swap
    - the `write` call with placeholder `"pending"` succeeds and the plan file contains the full expanded Markdown
    - `savings_stats.json` under `<cwd>/.claude/plans/` gains a `mode: "plan"` run whose `docOutputTokens` measures the whole document
@@ -440,6 +450,7 @@ This `-e`/`--extension` invocation is session-scoped: it will not register the e
 - ✅ Fallback modes (model bypasses the blueprint tool and writes real Markdown; no interference)
 - ✅ Scribe IR validation, resolution & hydration (`validateScribeBlueprint` rejection of malformed file/step tuples, unknown file ids, invalid operations, inverted ranges, empty strings — with the step requirement optional for the delta path; `hydrateScribeStep` resolving project-relative paths, reading files, extracting line ranges, 200-line cap, missing-file/outside-root notes; test suite in `tests/scribe-ir.test.ts`)
 - ✅ Plan-section splice engine (`tests/plan-sections.test.ts`: replacement in place leaves other sections byte-identical, a missing heading inserts at its canonical position, an unknown heading appends, drops remove the named section, fenced code blocks are ignored, and an update naming nothing returns the input unchanged)
+- ✅ Literal fidelity (`tests/literal-fidelity.test.ts`: extraction order across backticked spans, quoted identifiers, SCREAMING_SNAKE constants, `local://` references, template fragments, dotted calls, and project-relative paths; rejection of prose, a bare number, a two-character span, and a word-internal apostrophe; whitespace-normalized matching including re-wrapped and backtick-stripped text; gap reporting that keeps an absent section out of `missing` while still counting what it checked; repair-brief assembly. `tests/writer-session.test.ts` covers the repair pass end to end: the lossy draft is repaired with only the flagged section spliced, usage and cost accumulate onto the initial expansion, an unfixable gap is reported with the draft intact, a compliant draft spends no session, and an update-path delta triggers the same repair. `tests/index.test.ts` covers the tool result: `verified verbatim` plus `details.fidelity` for a compliant draft, and for a lossy one the unverified literal in backticks with a pointer at `propose_plan_update`, leaving the un-repaired draft in the pending store)
 - ✅ Delegated plan updates (tool registration and plan-mode-only activation, delta shape rejection for no-changes and steps-without-files, IR validation errors surfaced without storing a draft, `local://` artifact resolution from the artifacts dir and the temp-root fallback, locate failures, empty plan files, a writer response missing a requested heading rejected with the plan left untouched, drop-only deltas applied without a writer session, sequential updates building on the pending draft, the write swap finalizing the spliced plan, `deltaDocOutputTokens` pricing only the regenerated sections, and update failures incrementing the blueprint failure counters)
 - ✅ Baseline pricing (`@plan`-role fallback: an unpriced brain model prices its baseline from the reference model's rates with `baselineIsEstimate` tracking and `~$` dashboard marking; an unresolvable role keeps the legacy $0.00 lower bound)
 - ✅ Writer-model precedence (non-default CLI flag → persisted override → `@smol`) and persistence (round-trip, ENOENT/malformed/wrong-type self-heal, key removal on reset)
@@ -499,6 +510,18 @@ Delegated updates depend on the plan-document structure the initial expansion em
 1. **Section names and order** live in `PLAN_SECTIONS` (`src/plan-sections.ts`), from which `CANONICAL_PLAN_SECTIONS` is derived; keep them in step with the section headings `WRITER_SYSTEM_PROMPT` fixes. A heading level change requires updating `SECTION_HEADING_RE` too.
 2. **The writer's section contract** — one `## <heading>` per requested section, spelled as the brief spells it — is enforced by the update tool, which rejects a response missing any requested heading rather than splicing nothing.
 3. Rebuild and test: `npm run typecheck && npm run build && bun test`.
+
+### Maintaining the Literal-Fidelity Gate
+
+The gate is deliberately conservative: a literal it never extracts is simply not verified, which costs one lost guarantee, whereas a false positive costs a repair session on every plan. Widen it only when a real draft loses a literal the extractor never collected.
+
+1. **Extraction rules** live in `src/literal-fidelity.ts`: the per-shape patterns, `MIN_LITERAL_LENGTH`/`MAX_LITERAL_LENGTH`, and `isLiteralShaped()`'s whitespace, bare-number, and fragment-edge rejections. `extractLiterals()` keeps candidates in reading order and drops any candidate a literal kept earlier already contains, which is what makes a backticked template win over its `${...}` fragments. The gate is string-only — backticked, quoted, constant, `local://`, template, dotted-call, and path shapes — so prose, a bare number, and a two-character span all yield nothing. `FRAGMENT_EDGE_RE` rejects a candidate a split left dangling — one opening with `)`, `]`, `}`, `;`, or `,`, or ending with `(`, `[`, `{`, or `,` — and a backticked span that is exactly one quoted string yields the text inside its quotes, so `` (target `"artistas"`) `` extracts `artistas`.
+2. **What gets gated** is `fidelitySources()` in `src/writer-session.ts`: the canonical headings paired with the brief text that supplies each. A step is mined from its own lines only, never from the hydrated `source:` snippet — that snippet is code the writer reads for grounding, not a literal it must echo. `planFidelityTargets()` builds the blueprint path's targets and `deltaFidelityTargets()` the delta path's, which deliberately omits `context` because a refinement's Context paragraph is folded into existing prose rather than reproduced.
+3. **A literal list never satisfies the gate**: `literalDumpLines()`/`removeLiteralDumpLines()` flag a bullet, list item, or bare line whose whole content is backticked literals, so `enforceLiteralFidelity` strips them from a draft before the check and refuses a repair response whose section carries one. The helpers are line-based and fence-blind, and deliberately separator-agnostic (`LINE_MARKER_RE`, `BACKTICK_SPAN_RE`, `SEPARATOR_RE`) — widen `SEPARATOR_RE` when a real dump line reduces to something else.
+4. **Repair budget and loop bound**: `MAX_FIDELITY_REPAIR_ROUNDS` (`src/writer-session.ts`). Setting it to `0` degrades the gate to report-only with no other code change. A round that leaves the document byte-identical ends the loop early, and `enforceLiteralFidelity` notifies once after the loop — a residue warning while literals are still missing, else an info that the repair restored them — instead of warning before it.
+5. **Prompts move in lockstep**: a new literal shape needs its rule in `WRITER_SYSTEM_PROMPT`, `PLAN_UPDATE_WRITER_SYSTEM_PROMPT`, `DOC_WRITER_SYSTEM_PROMPT`, `PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT`, the `<scribe>` directive's `intent` bullet, and both plan tools' `steps` description (`STEP_LITERAL_REQUIREMENT` in `index.ts`).
+6. **Section presence is reported, never repaired**: a target heading the draft never emitted lands in `missingSections`, because inserting a section the caller never asked for would change the plan and the update path already owns the unrendered-heading rejection.
+7. Rebuild and test: `npm run typecheck && npm run build && bun test`.
 
 ### Updating oh-my-pi Contracts
 
