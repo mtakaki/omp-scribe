@@ -363,6 +363,10 @@ parameters: z.object({
     .describe("Plan slug; the final file is local://<slug>-plan.md"),
   title: z.string().describe("Short plan title"),
   context: z.string().describe("2-4 sentences: literal ask, need, intended end state"),
+  literals: z
+    .array(z.array(z.unknown()).min(2).max(2))
+    .optional()
+    .describe("Load-bearing literals, each a 2-element [id, value] tuple; write the [[<id>]] marker where the value belongs …"),
   files: z
     .array(z.array(z.unknown()).min(3).max(3))
     .min(1)
@@ -383,7 +387,8 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
   const raw = params as PlanBlueprintInput;          // Safe coercion after Zod validation
   const blueprint: PlanBlueprint = {
     ...raw,
-    verification: raw.verification ?? [],            // Fill the optional fields the model omitted
+    literals: raw.literals ?? [],                    // Fill the optional fields the model omitted
+    verification: raw.verification ?? [],
     assumptions: raw.assumptions ?? [],
   };
   // ...
@@ -393,6 +398,7 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 **Pattern:**
 - Zod validates input at the tool boundary (guarantees schema compliance)
 - `.describe()` provides human-readable field documentation, including the exact tuple arity and field order
+- `literals` is an optional table of 2-element `[id, value]` tuples — ids match `[A-Za-z][A-Za-z0-9_-]{0,15}` and are unique ignoring case, values are at most 1000 characters — and the planner writes the `[[<id>]]` marker where a value belongs instead of the value itself, so the extension substitutes the exact string without the writer typing it
 - `.min(1)` enforces non-empty arrays; `.optional()` keeps trailing fields the model may drop on a large call from failing the whole tool call
 - `.regex()` enforces slug format
 - `params as PlanBlueprintInput` is safe because Zod has already validated the shape
@@ -498,6 +504,7 @@ export async function expandBlueprintToMarkdown( /* ... */ ): Promise<ExpandResu
 ```typescript
 export type ScribeOperation = "+" | "!" | "~";
 export type ScribeFile = readonly [id: string, path: string, reason: string];
+export type ScribeLiteral = readonly [id: string, value: string];
 export type ScribeRange = readonly [start: number, end: number];
 export type ScribeStep = readonly [fileId: string, operation: ScribeOperation, range: ScribeRange | null, intent: string, preserve: readonly string[], doNot: readonly string[]];
 export interface PlanBlueprint { /* ... */ }
@@ -506,10 +513,12 @@ export interface DocBlueprint { /* ... */ }
 export interface ScribeStepResolved { /* ... */ }   // scribe-ir.ts
 export interface HydratedScribeStep { /* ... */ }   // scribe-ir.ts
 export interface ScribeConfig { /* ... */ }         // config.ts
-export interface ExpandSuccess { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number; fidelity?: FidelityReport };  // writer-session.ts
+export interface ExpandSuccess { markdown: string; model: { provider: string; id: string }; usage: { input: number; output: number }; costUsd: number; fidelity?: FidelityReport; literalMetrics: LiteralRunMetrics };  // writer-session.ts
 export type ExpandResult = ExpandSuccess | { error: string };  // writer-session.ts
 export interface FidelityTarget { heading: string; literals: readonly string[] };  // literal-fidelity.ts
 export interface FidelityReport { checked: number; repaired: boolean; missing: string[]; missingSections: string[]; gaps: FidelityGap[] };  // literal-fidelity.ts
+export interface LiteralRunMetrics { resolved: number; unresolved: string[]; repairRounds: number; repairInputTokens: number; repairOutputTokens: number };  // literal-fidelity.ts
+export interface PlaceholderResolution { markdown: string; resolved: number; unresolved: string[] };  // literal-fidelity.ts
 ```
 
 **Pattern:**
@@ -1053,27 +1062,29 @@ if (input.content.trim() === PLACEHOLDER_CONTENT) {
 ```typescript
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`files\` and \`steps\` arrays:
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`literals\`, \`files\`, and \`steps\` arrays:
+   literals entries are [id, value] — declare each exact string the plan must preserve character-for-character (an identifier, path, command, expression, or constant) once. id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact text, at most 1000 characters. Then reference each declared id where its value belongs by writing the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once. The extension replaces each marker with the exact value after the writer's response, so the writer never types it.
    files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
    steps entries are [fileId, operation, range, intent, preserve, doNot]:
    - \`fileId\` — must match an id in \`files\`.
    - \`operation\` — "+" add, "!" delete, "~" modify.
    - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
-   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
+   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code, but reference every load-bearing literal the change depends on by its declared [[<id>]] marker.
    - \`preserve\` — array of things that must keep working; empty array when none.
    - \`doNot\` — array of explicit prohibitions; empty array when none.
    Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
-   Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
+   Example: literals: [["A1","cookie_name"]], files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing [[A1]] cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
 2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
-3. Then continue the normal \`xd://propose\` submission with that slug, as usual.
-Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
+3. To record a refinement after the plan file exists, call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug plus ONLY the fields that changed — \`literals\` (declare any new exact string here and reference it where it belongs by its [[<id>]] marker), \`context\`, \`files\` (together with \`steps\`, since every step references a file id), \`verification\`, \`assumptions\` — then \`write\` the placeholder again; the extension rewrites just those sections and splices them into the existing file. …
+4. Then continue the normal \`xd://propose\` submission with that slug, as usual.
+Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>\`;
 ```
 
 **Pattern:**
 - Directive is injected into the system prompt to enforce call ordering
 - Model is told: blueprint tool first, then `write`, then propose
-- The `files`/`steps` tuple shape — including a worked one-step example — is spelled out in the directive, so the model never has to infer the IR or guess field order
+- The `literals` table and the `files`/`steps` tuple shapes — including a worked one-step example that references a `[[<id>]]` marker — are spelled out in the directive, so the model never has to infer the IR or guess field order
 - Violations are detected in the `tool_call` handler (placeholder write with no drafted Markdown)
 - The contract is human-readable and tied to specific tool names
 - `DOC_SCRIBE_DIRECTIVE` enforces the analogous order for doc mode: call `propose_doc_blueprint` exactly once, then `write` the declared path with the placeholder — never compose the body directly
@@ -1133,7 +1144,7 @@ blueprint.steps.forEach((entry, index) => {
 
 **Pattern:**
 - Every message names the offending index and, where known, the file id, so the planning model can correct exactly one thing and resubmit
-- Validation is strict and total: it runs before any step is resolved or read from disk, and it never silently repairs malformed IR
+- Validation is strict and total: it runs before any step is resolved or read from disk, and it never silently repairs malformed IR; the same holds for a declared literal table — `validateLiteralTable` rejects a malformed `[id, value]` tuple or an id outside the grammar, and `validateLiteralUsage` rejects a declared id no `[[id]]` marker references, both before any file is read
 - Cross-field checks the schema genuinely cannot express (does this `fileId` appear in `files`? is this `range` inverted?) live here, which is why `resolveScribeSteps()` is documented as call-after-validate
 - `expandBlueprintToMarkdown` catches the throw and returns it as `{ error }`, preserving the module's "errors are return values" contract
 
@@ -1141,25 +1152,37 @@ blueprint.steps.forEach((entry, index) => {
 
 **File: `literal-fidelity.ts` & `writer-session.ts`**
 
-The literals a brief carries are a contract the cheap writer honors only probabilistically, so the draft is verified against the brief and repaired within a bounded budget instead of trusted:
+The literals a brief carries are a contract the cheap writer honors only probabilistically, so a literal the planner declares in the brief's table is substituted deterministically from the `[[id]]` marker the draft leaves behind, and the remaining draft is verified against the brief and repaired within a bounded budget instead of trusted:
 
 ```typescript
+const resolution = resolveLiteralPlaceholders(removeLiteralDumpLines(expansion.markdown), literals);
+const metrics: LiteralRunMetrics = { resolved: resolution.resolved, unresolved: resolution.unresolved, repairRounds: 0, repairInputTokens: 0, repairOutputTokens: 0 };
+const declaredKeys = new Set((literals ?? []).map(([, value]) => normalizeForMatch(value)));
+let markdown = resolution.markdown;
 let report = checkFidelity(targets, splitPlanSections(markdown).sections);
+const repairableGaps = (current: FidelityReport): FidelityGap[] => current.gaps
+  .map(gap => ({ heading: gap.heading, missing: gap.missing.filter(literal => !declaredKeys.has(normalizeForMatch(literal))) }))
+  .filter(gap => gap.missing.length > 0);   // a declared literal the writer omitted is reported, never re-typed
+let repairable = repairableGaps(report);
 let rounds = 0;
-while (report.missing.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
+while (repairable.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
   rounds += 1;
-  const repaired = await runWriterExpansionWithRetry(pi, ctx, writerModel, PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT, buildRepairPromptText(report.gaps, targets, current));
+  const repaired = await runWriterExpansionWithRetry(pi, ctx, writerModel, PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT, buildRepairPromptText(repairable, targets, current, literals));
   if ("error" in repaired) break;
-  markdown = splicePlanSections(markdown, replacementsFor(repaired, report.gaps));  // flagged headings only
+  markdown = splicePlanSections(markdown, replacementsFor(repaired, repairable));  // markers resolved first; flagged headings only
   report = checkFidelity(targets, splitPlanSections(markdown).sections);
+  repairable = repairableGaps(report);
 }
-return { ...expansion, markdown, usage: accumulated, costUsd, fidelity: { ...report, repaired: rounds > 0 } };
+return { ...expansion, markdown, usage: accumulated, costUsd, fidelity: { ...report, repaired: rounds > 0 }, literalMetrics: { ...metrics, repairRounds: rounds } };
 ```
 
 **Pattern:**
 - Post-conditions are verified rather than assumed: the literals come from the brief input, never from what the draft claims to cover
+- The deterministic path runs first: `resolveLiteralPlaceholders` substitutes every `[[id]]` marker over the dump-stripped draft, so a declared literal reaches the plan character-for-character and spends no repair session
+- Only the literals no table entry declares are repaired, and the repairable set is recomputed from each fresh report: a declared literal the writer omitted is reported through `fidelity.missing` instead of being re-typed by an LLM, because the extension already knows its exact value
+- `buildRepairPromptText` takes the table as its fourth argument, so a repair brief shows a missing declared literal as its `[[id]]` marker and JSON value while a literal no entry declares keeps the backticked value
 - Repair is bounded (`MAX_FIDELITY_REPAIR_ROUNDS`; `0` degrades to report-only) and reports its residue instead of throwing, so a usable draft is never lost to an unfixable gap
-- Only the flagged sections are spliced back, so a repair response cannot rewrite a section the gate did not name
+- Only the flagged sections are spliced back, so a repair response cannot rewrite a section the gate did not name; the replacement's own markers are resolved before it lands
 - A target section the draft never emitted is reported through `missingSections`, never inserted — inserting one would change the plan, and the update path's unrendered-heading rejection owns that decision
 - Matching is whitespace-normalized and the extractor is conservative by design: a missed literal costs one guarantee, a false positive costs a session on every plan
 
@@ -1179,7 +1202,7 @@ return { ...expansion, markdown, usage: accumulated, costUsd, fidelity: { ...rep
 
 6. **Events: Declarative binding, closure capture for state.** All handlers registered in factory; shared state via module variables.
 
-7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, and tool schemas all prevent invalid states, `validateScribeBlueprint` enforces the per-field Scribe IR contract that a single regex previously covered only partially, and the literal-fidelity gate verifies the writer's draft against the brief's literals and repairs the sections that lost one within a bounded budget.
+7. **Contracts: Regex, strings, schemas for enforcement.** Path matching, prompt markers, and tool schemas all prevent invalid states, `validateScribeBlueprint` enforces the per-field Scribe IR contract that a single regex previously covered only partially, a declared literal table is validated (`validateLiteralTable`/`validateLiteralUsage`) before any file is read, and the literal-fidelity gate substitutes the literals the table declares deterministically before verifying the writer's draft against the brief's literals and repairing, within a bounded budget, only the sections that lost a literal no table entry declares.
 
 8. **Injection: Host provides SDK singletons via `pi` namespace.** Never import the SDK directly; use injected `pi` to access live singletons.
 

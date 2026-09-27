@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { LiteralRunMetrics } from "./literal-fidelity";
 
 /** Name of the compact-blueprint tool registered by this extension. */
 export const BLUEPRINT_TOOL_NAME = "propose_plan_blueprint";
@@ -322,6 +323,11 @@ export interface PendingBlueprint {
    *  have had to emit; absent for full-document drafts, which fall back to
    *  measuring `markdown`. */
   deltaDocOutputTokens?: number;
+  /** The deterministic `[[id]]` marker substitutions and the repair-session
+   *  spend this draft accrued.  The repair tokens are a subset of
+   *  `writerUsage`, already reflected in `writerCostUsd`, so they carry as a
+   *  breakdown rather than a second cost. */
+  literalMetrics?: LiteralRunMetrics;
 }
 
 const PENDING_STORE_KEY = "scribe-extension.pendingBlueprintStore";

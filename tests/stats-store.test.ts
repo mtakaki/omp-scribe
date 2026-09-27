@@ -244,6 +244,32 @@ describe("appendBlueprintFailure", () => {
 });
 
 describe("formatSavingsDashboard", () => {
+  it("renders the accumulated literal/repair totals and the closing note", async () => {
+    await appendSavingsRun(
+      cwd,
+      makeEntry({ literalResolved: 5, llmRepairCalls: 2, llmRepairInputTokens: 300, llmRepairOutputTokens: 120 }),
+    );
+    const output = formatSavingsDashboard(await readStatsFile(cwd));
+
+    const resolvedRow = output.split("\n").find(line => line.includes("Literals resolved (deterministic)"));
+    expect(resolvedRow).toContain("5");
+    const callsRow = output.split("\n").find(line => line.includes("LLM literal-repair calls"));
+    expect(callsRow).toContain("2");
+    const tokensRow = output.split("\n").find(line => line.includes("LLM repair tokens (in+out)"));
+    expect(tokensRow).toContain("420");
+    expect(output).toContain("an LLM literal-repair call runs only for a literal the planner never declared");
+  });
+
+  it("renders zero for the literal/repair rows on a zeroed ledger", async () => {
+    const output = formatSavingsDashboard(await readStatsFile(cwd));
+
+    for (const label of ["Literals resolved (deterministic)", "LLM literal-repair calls", "LLM repair tokens (in+out)"]) {
+      const row = output.split("\n").find(line => line.includes(label));
+      expect(row).toBeDefined();
+      expect(row).toContain("0");
+    }
+  });
+
   it("renders a non-empty box for zero-run stats", () => {
     const empty: SavingsStatsFile = {
       version: 1,

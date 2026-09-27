@@ -2201,4 +2201,79 @@ Context sentence.
     expect(entry?.markdown).toContain("## Approach");
     expect(entry?.markdown).not.toContain("src/example.ts");
   });
+
+  /** A blueprint declaring one literal and referencing it by marker in both the
+   *  Context paragraph and the step intent. */
+  function makeLiteralBlueprint(slug: string) {
+    return {
+      slug,
+      title: "Fixture Plan",
+      context: "Context sentence referencing [[L1]].",
+      files: EXAMPLE_FILES,
+      steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[L1]]`.", [], []]],
+      verification: [],
+      assumptions: [],
+      literals: [["L1", "scribe_literal_value"]],
+    };
+  }
+
+  /** A draft that emits the declared marker in both sections it supplies. */
+  const MARKER_DRAFT = `# Fixture Plan
+
+## Context
+
+Context sentence referencing [[L1]].
+
+## Approach
+
+- Modify \`src/example.ts\` to use \`[[L1]]\`.
+
+## Critical files & anchors
+
+- \`src/example.ts\` — example file
+`;
+
+  it("substitutes a declared literal table and records the metrics in the savings run", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(MARKER_DRAFT));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-literal-table",
+      makeLiteralBlueprint("literal-table"),
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("verified verbatim");
+    expect(text).toContain("substituted 2 declared literals from the literal table deterministically");
+    const details = result["details"] as {
+      fidelity?: { missing: string[] };
+      literalMetrics?: { resolved: number; repairRounds: number };
+    };
+    expect(details.fidelity?.missing).toEqual([]);
+    expect(details.literalMetrics?.resolved).toBeGreaterThan(0);
+    expect(details.literalMetrics?.repairRounds).toBe(0);
+
+    // The pending draft carries the exact substituted value and no marker.
+    const entry = pendingMarkdownStore().get("literal-table");
+    expect(entry?.markdown).toContain("scribe_literal_value");
+    expect(entry?.markdown).not.toContain("[[");
+
+    await fakeApi.emit("tool_call", makeWriteEvent("local://literal-table-plan.md", "pending", "tc-literal-1"), ctx);
+
+    const stats = await readStatsFile(cwd);
+    expect(stats.runs[0]!.literalResolved).toBe(2);
+    expect(stats.runs[0]!.llmRepairCalls).toBe(0);
+    expect(stats.totalLiteralResolved).toBe(2);
+    expect(stats.totalLlmRepairCalls).toBe(0);
+    expect(stats.totalLlmRepairInputTokens).toBe(0);
+    expect(stats.totalLlmRepairOutputTokens).toBe(0);
+  });
 });

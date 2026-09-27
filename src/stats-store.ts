@@ -39,6 +39,17 @@ export interface SavingsRunLogEntry {
    *  model's rates because the live brain model had no catalog rate of its own;
    *  absent in legacy entries (treat as `false`). */
   baselineIsEstimate?: boolean;
+  /** `[[id]]` markers the extension substituted with their declared literal
+   *  value, counted per occurrence.  Zero for a run that declared no table. */
+  literalResolved?: number;
+  /** LLM literal-repair rounds the fidelity gate ran for this run.  A declared
+   *  literal the writer omitted is reported, never repaired, so the usual value
+   *  is 0. */
+  llmRepairCalls?: number;
+  /** Input tokens those repair rounds spent; a subset of `writerInputTokens`. */
+  llmRepairInputTokens?: number;
+  /** Output tokens those repair rounds spent; a subset of `writerOutputTokens`. */
+  llmRepairOutputTokens?: number;
 }
 
 /** Persisted cumulative stats plus a capped recent-run log.
@@ -88,6 +99,17 @@ export interface SavingsStatsFile {
   /** Count of blueprint tool calls whose result was an error (the writer
    *  expansion failed). Required for the same reason as `blueprintCallsTotal`. */
   blueprintCallsFailed: number;
+  /** Cumulative `[[id]]` markers substituted deterministically; optional for
+   *  backward compat with earlier files. */
+  totalLiteralResolved?: number;
+  /** Cumulative LLM literal-repair rounds; optional for backward compat. */
+  totalLlmRepairCalls?: number;
+  /** Cumulative input tokens spent on literal repair; optional for backward
+   *  compat. */
+  totalLlmRepairInputTokens?: number;
+  /** Cumulative output tokens spent on literal repair; optional for backward
+   *  compat. */
+  totalLlmRepairOutputTokens?: number;
   /** Most-recent runs first; capped at 200. */
   runs: SavingsRunLogEntry[];
 }
@@ -116,6 +138,10 @@ function emptyStatsFile(): SavingsStatsFile {
     totalDocOutputTokens: 0,
     blueprintCallsTotal: 0,
     blueprintCallsFailed: 0,
+    totalLiteralResolved: 0,
+    totalLlmRepairCalls: 0,
+    totalLlmRepairInputTokens: 0,
+    totalLlmRepairOutputTokens: 0,
     runs: [],
   };
 }
@@ -189,6 +215,10 @@ export async function appendSavingsRun(cwd: string, entry: SavingsRunLogEntry): 
       (entry.docOutputTokens ?? entry.writerOutputTokens),
     blueprintCallsTotal: current.blueprintCallsTotal + 1,
     blueprintCallsFailed: current.blueprintCallsFailed,
+    totalLiteralResolved: (current.totalLiteralResolved ?? 0) + (entry.literalResolved ?? 0),
+    totalLlmRepairCalls: (current.totalLlmRepairCalls ?? 0) + (entry.llmRepairCalls ?? 0),
+    totalLlmRepairInputTokens: (current.totalLlmRepairInputTokens ?? 0) + (entry.llmRepairInputTokens ?? 0),
+    totalLlmRepairOutputTokens: (current.totalLlmRepairOutputTokens ?? 0) + (entry.llmRepairOutputTokens ?? 0),
     runs: [entry, ...current.runs].slice(0, 200),
   };
 
@@ -307,6 +337,12 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     dataRow("Writer tokens output", num(stats.totalWriterOutputTokens)),
     dataRow("Blueprint tokens (brain, est.)", num(blueprintOutputTokens)),
     dataRow("Delegated doc tokens (est.)", num(documentOutputTokens)),
+    dataRow("Literals resolved (deterministic)", num(stats.totalLiteralResolved ?? 0)),
+    dataRow("LLM literal-repair calls", num(stats.totalLlmRepairCalls ?? 0)),
+    dataRow(
+      "LLM repair tokens (in+out)",
+      num((stats.totalLlmRepairInputTokens ?? 0) + (stats.totalLlmRepairOutputTokens ?? 0)),
+    ),
     dataRow("Estimated brain tokens output without scribe", num(estimatedBrainOutputTokens)),
     SEP,
     dataRow("Free/local writer runs", num(stats.totalFreeWriterRuns ?? 0)),
@@ -347,6 +383,11 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     `ℹ  "Writer tokens output" is the writer model's raw usage, which includes generation that never reached the ` +
       `returned document; "Delegated doc tokens (est.)" measures the Markdown actually returned (~4 chars/token), and the ` +
       `without-scribe row uses that figure.`,
+  );
+
+  lines.push(
+    `ℹ  Literals are declared in the planner's "literals" table and referenced as [[id]] markers, so the extension ` +
+      `substitutes them deterministically; an LLM literal-repair call runs only for a literal the planner never declared.`,
   );
 
   return lines.join("\n");

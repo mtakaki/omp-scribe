@@ -1,6 +1,6 @@
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Model } from "@oh-my-pi/pi-catalog";
-import type { DocBlueprint, PlanBlueprint, PlanUpdateBlueprint, ScribeFile, ScribeOperation, ScribeStep } from "./types";
+import type { DocBlueprint, PlanBlueprint, PlanUpdateBlueprint, ScribeFile, ScribeLiteral, ScribeOperation, ScribeStep } from "./types";
 import { hydrateScribeStep, resolveScribeSteps, validateScribeBlueprint, type HydratedScribeStep, type ScribeStepResolved } from "./scribe-ir";
 import { PLAN_SECTIONS, planHeadingKey, splicePlanSections, splitPlanSections, type PlanDocument, type PlanSection } from "./plan-sections";
 import {
@@ -8,9 +8,18 @@ import {
   buildRepairPromptText,
   checkFidelity,
   extractLiterals,
+  formatLiteralTable,
   literalDumpLines,
+  mergeLiterals,
+  normalizeForMatch,
+  referencedLiterals,
   removeLiteralDumpLines,
+  resolveLiteralPlaceholders,
+  validateLiteralTable,
+  validateLiteralUsage,
+  type FidelityGap,
   type FidelityReport,
+  type LiteralRunMetrics,
   type RepairTarget,
 } from "./literal-fidelity";
 import { resolveWriterModel } from "./config";
@@ -22,6 +31,7 @@ Scribe has already decoded the plan. The APPROACH STEPS are authoritative.
 The brief is labelled plain text:
 TITLE - the plan title, to become the "# " heading.
 CONTEXT - the ask and intended end state.
+LITERALS - optional; when present, each line is \`[[<id>]] = <json value>\`, the exact values the brief's \`[[<id>]]\` markers stand for.
 APPROACH STEPS - numbered steps. Each prints:
     the target file path
     operation: add | delete | modify
@@ -45,8 +55,8 @@ For each step:
 8. Do not add implementation steps that are not present in the brief.
 9. If the source conflicts with the stated intent, describe the conflict instead of guessing.
 10. Do not turn source-code observations into requirements unless the brief explicitly states them.
-11. Reproduce every literal the brief carries — an identifier, path, command, expression, or constant — verbatim and in backticks in your prose; never paraphrase, abbreviate, re-case, reformat, or drop one.
-12. Never emit a bullet, list item, or line that consists only of literals: every literal belongs inside a sentence that states its role.
+11. Where the brief writes a \`[[<id>]]\` marker, emit that marker verbatim: the extension replaces it with the exact value after your response. Never write the value a marker stands for, and never invent a marker the LITERALS block does not list.
+12. Emit every marker the brief supplies, exactly where its value belongs. Never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.
 
 You are a renderer, not a planner.
 
@@ -71,13 +81,14 @@ Expand tersely into full sentences: add no content the brief does not supply, an
 
 export const DOC_WRITER_SYSTEM_PROMPT = `You expand compact JSON document outlines into complete Markdown documents. You receive one JSON object as the user message and must respond with ONLY the finished Markdown document: no preamble, no code fences, no commentary before or after.
 
-Prefix the document with "# <title>" using the JSON "title" field, then for each entry in the JSON "sections" array emit one "## <heading>" heading followed by the bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and never invent content beyond what the bullets supply. Reproduce every literal a bullet carries — an identifier, path, command, expression, or constant — verbatim and in backticks; never paraphrase, abbreviate, re-case, or reformat one.`;
+Prefix the document with "# <title>" using the JSON "title" field, then for each entry in the JSON "sections" array emit one "## <heading>" heading followed by the bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and never invent content beyond what the bullets supply. The JSON payload may carry a "literals" array of [id, value] tuples; a bullet that writes a \`[[<id>]]\` marker stands for that entry's exact value. Where a bullet writes a marker, emit that marker verbatim — the extension replaces it with the exact value after your response. Never write the value a marker stands for, never invent a marker the payload's "literals" array does not list, and never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.`;
 
 export const PLAN_UPDATE_WRITER_SYSTEM_PROMPT = `You revise named sections of an existing Markdown implementation plan. You receive one plain-text brief as the user message and must respond with ONLY the rewritten sections: for every heading the brief lists under REQUESTED SECTIONS, its "## <heading>" line spelled exactly as the brief spells it, followed by that section's new body. No "# " title, no preamble, no code fences, no commentary, and never a section the brief does not request.
 
 The brief is labelled plain text:
 REQUESTED SECTIONS - the headings to emit, in the order to emit them.
 REMOVED SECTIONS - headings the plan is dropping; never emit them.
+LITERALS - optional; when present, each line is \`[[<id>]] = <json value>\`, the exact values the brief's \`[[<id>]]\` markers stand for.
 Then one block per requested section:
     CURRENT - that section's present Markdown, or "(no current content)" when the plan has no such section yet.
     CHANGES - the new input for that section, in one of three shapes:
@@ -95,22 +106,23 @@ Rules:
 7. Treat preserve items as hard constraints and do-not items as explicit prohibitions.
 8. Do not infer requirements from the source code, and do not invent files, implementation details, APIs, dependencies, behavior, or steps the brief does not supply.
 9. Do not restate, summarize, or reference any section the brief does not request.
-10. Reproduce every literal the brief carries — an identifier, path, command, expression, or constant — verbatim and in backticks; never paraphrase, abbreviate, re-case, reformat, or drop one.
-11. Never emit a bullet, list item, or line that consists only of literals: every literal belongs inside a sentence that states its role.
+10. Where the brief writes a \`[[<id>]]\` marker, emit that marker verbatim: the extension replaces it with the exact value after your response. Never write the value a marker stands for, and never invent a marker the LITERALS block does not list.
+11. Emit every marker the brief supplies, exactly where its value belongs. Never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.
 
 You are a renderer, not a planner. Expand tersely into full sentences: add no content the brief does not supply, and alter no literal it supplies.`;
 
 /** A completed writer expansion: the Markdown it produced, the model that
- *  produced it, the tokens and dollars it spent, and — for the plan paths —
- *  the literal-fidelity gate's verdict on the result.  Doc mode leaves
- *  `fidelity` unset: a lossy doc draft has no update path to steer the brain
- *  into, so the gate would only spend a repair session. */
+ *  produced it, the tokens and dollars it spent, the literal-fidelity gate's
+ *  verdict on the result, and what the literal table cost.  `literalMetrics`
+ *  counts the `[[id]]` markers substituted deterministically while the repair
+ *  fields cover only the literals no table entry declares. */
 export interface ExpandSuccess {
   markdown: string;
   model: { provider: string; id: string };
   usage: { input: number; output: number };
   costUsd: number;
   fidelity?: FidelityReport;
+  literalMetrics: LiteralRunMetrics;
 }
 
 export type ExpandResult = ExpandSuccess | { error: string };
@@ -190,7 +202,15 @@ async function runWriterExpansion(
 
     const markdown = (messageText || streamed).trim();
     if (!markdown) return { error: "Writer model returned an empty response." };
-    return { markdown, model: { provider: writerModel.provider, id: writerModel.id }, usage: writerUsage, costUsd: writerCostUsd };
+    return {
+      markdown,
+      model: { provider: writerModel.provider, id: writerModel.id },
+      usage: writerUsage,
+      costUsd: writerCostUsd,
+      // The gate overwrites these once it has run; a raw expansion substitutes
+      // no marker and spends no repair round.
+      literalMetrics: { resolved: 0, unresolved: [], repairRounds: 0, repairInputTokens: 0, repairOutputTokens: 0 },
+    };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   } finally {
@@ -271,7 +291,16 @@ function renderStepBlock(index: number, { step, snippet }: HydratedScribeStep): 
  *  matching {@link WRITER_SYSTEM_PROMPT}'s "omit when the brief has no such
  *  block" rule exactly. */
 export function buildPlanPromptText(blueprint: PlanBlueprint, steps: readonly HydratedScribeStep[]): string {
-  const blocks: string[] = ["TITLE", blueprint.title, "", "CONTEXT", blueprint.context, "", "APPROACH STEPS"];
+  const blocks: string[] = [
+    "TITLE",
+    blueprint.title,
+    "",
+    "CONTEXT",
+    blueprint.context,
+    "",
+    ...formatLiteralTable(blueprint.literals),
+    "APPROACH STEPS",
+  ];
   steps.forEach((hydrated, index) => blocks.push(...renderStepBlock(index, hydrated)));
 
   const appendBullets = (label: string, items: readonly string[]): void => {
@@ -301,10 +330,15 @@ export function buildPlanPromptText(blueprint: PlanBlueprint, steps: readonly Hy
 export const MAX_FIDELITY_REPAIR_ROUNDS = 2;
 
 /** One brief-supplied plan section, ready for literal extraction: the heading
- *  the draft must carry it under, and the text it is written from. */
+ *  the draft must carry it under, and the text it is written from.
+ *  `extractInline` mines that text for literal-shaped strings as well as the
+ *  declared `[[id]]` markers it references — false for a refinement's Context
+ *  paragraph, whose wording legitimately changes while its markers stay
+ *  required. */
 interface FidelitySource {
   heading: string;
   text: string;
+  extractInline: boolean;
 }
 
 /** The step's own brief lines — everything {@link renderStepBlock} prints ahead
@@ -330,25 +364,29 @@ function fidelitySources(input: {
   assumptions: readonly string[];
 }): FidelitySource[] {
   return [
-    { heading: PLAN_SECTIONS.context, text: input.context ?? "" },
-    { heading: PLAN_SECTIONS.steps, text: input.steps.map((hydrated, index) => stepBriefText(index, hydrated)).join("\n") },
-    { heading: PLAN_SECTIONS.files, text: input.files.map(([, path, reason]) => `${path} — ${reason}`).join("\n") },
-    { heading: PLAN_SECTIONS.verification, text: input.verification.map(item => `- ${item}`).join("\n") },
-    { heading: PLAN_SECTIONS.assumptions, text: input.assumptions.map(item => `- ${item}`).join("\n") },
+    { heading: PLAN_SECTIONS.context, text: input.context ?? "", extractInline: true },
+    { heading: PLAN_SECTIONS.steps, text: input.steps.map((hydrated, index) => stepBriefText(index, hydrated)).join("\n"), extractInline: true },
+    { heading: PLAN_SECTIONS.files, text: input.files.map(([, path, reason]) => `${path} — ${reason}`).join("\n"), extractInline: true },
+    { heading: PLAN_SECTIONS.verification, text: input.verification.map(item => `- ${item}`).join("\n"), extractInline: true },
+    { heading: PLAN_SECTIONS.assumptions, text: input.assumptions.map(item => `- ${item}`).join("\n"), extractInline: true },
   ];
 }
 
 /** The repair targets for a set of sources: a section with no text to expand
- *  and one whose text carries no literal alike need no gate, so both are
- *  dropped rather than verified against nothing. */
-function fidelityTargets(sources: readonly FidelitySource[]): RepairTarget[] {
+ *  and one whose text carries neither a declared marker nor an inline literal
+ *  alike need no gate, so both are dropped rather than verified against
+ *  nothing.  Each target's literals are the declared values its `[[id]]`
+ *  markers reference, followed by the literals its own text supplies when
+ *  `extractInline` allows it. */
+function fidelityTargets(sources: readonly FidelitySource[], literals: readonly ScribeLiteral[] | undefined): RepairTarget[] {
   const targets: RepairTarget[] = [];
   for (const source of sources) {
     const supplied = source.text.trim();
     if (supplied === "") continue;
-    const literals = extractLiterals(supplied);
-    if (literals.length === 0) continue;
-    targets.push({ heading: source.heading, literals, supplied });
+    const inline = source.extractInline ? extractLiterals(resolveLiteralPlaceholders(source.text, literals).markdown) : [];
+    const merged = mergeLiterals(referencedLiterals(source.text, literals), inline);
+    if (merged.length === 0) continue;
+    targets.push({ heading: source.heading, literals: merged, supplied });
   }
   return targets;
 }
@@ -363,23 +401,35 @@ function planFidelityTargets(blueprint: PlanBlueprint, steps: readonly HydratedS
       verification: blueprint.verification,
       assumptions: blueprint.assumptions,
     }),
+    blueprint.literals,
   );
 }
 
 /** The literals a delta commits its rewritten sections to.  Only the fields the
  *  delta supplies are checked — the gate must never demand a literal for a
- *  section the update did not name — and `context` is deliberately absent: a
- *  refinement's Context paragraph is folded into the section's existing prose
- *  rather than reproduced, so its wording legitimately changes. */
+ *  section the update did not name — and `context` is gated on its declared
+ *  markers alone: a refinement's Context paragraph is folded into the section's
+ *  existing prose rather than reproduced, so its wording legitimately changes. */
 function deltaFidelityTargets(delta: PlanUpdateBlueprint, steps: readonly HydratedScribeStep[]): RepairTarget[] {
-  return fidelityTargets(
-    fidelitySources({
-      steps,
-      files: delta.files ?? [],
-      verification: delta.verification ?? [],
-      assumptions: delta.assumptions ?? [],
-    }),
-  );
+  const sources = fidelitySources({
+    context: delta.context,
+    steps,
+    files: delta.files ?? [],
+    verification: delta.verification ?? [],
+    assumptions: delta.assumptions ?? [],
+  }).map(source => (source.heading === PLAN_SECTIONS.context ? { ...source, extractInline: false } : source));
+  return fidelityTargets(sources, delta.literals);
+}
+
+/** The literals a doc blueprint commits the document to: one target per section,
+ *  mined from the bullets joined by newlines. */
+function docFidelityTargets(blueprint: DocBlueprint): RepairTarget[] {
+  const sources: FidelitySource[] = blueprint.sections.map(section => ({
+    heading: section.heading,
+    text: section.bullets.join("\n"),
+    extractInline: true,
+  }));
+  return fidelityTargets(sources, blueprint.literals);
 }
 
 /** The verdict for a draft the gate has nothing to compare: no literal to
@@ -389,39 +439,74 @@ function emptyFidelityReport(): FidelityReport {
 }
 
 /**
- * Applies the literal-fidelity gate to a finished expansion: compares every
- * target's literals against the draft, asks the writer to re-emit the sections
- * that lost one — at most {@link MAX_FIDELITY_REPAIR_ROUNDS} times — and
- * reports what is still missing.  Each repair response is spliced in place, so
- * every section the gate did not target keeps its exact bytes.  The extra
- * sessions' usage and cost accumulate onto the expansion, so the caller keeps
- * pricing the whole delegation.
+ * Applies the literal-fidelity gate to a finished expansion.  The deterministic
+ * path runs first: every `[[id]]` marker a declared literal owns is replaced
+ * with that literal's exact value, so a marker the writer emitted needs no
+ * verification at all.  Whatever the table does not declare is then compared
+ * against the draft, and the gate asks the writer to re-emit the sections that
+ * lost one — at most {@link MAX_FIDELITY_REPAIR_ROUNDS} times — reporting what
+ * is still missing.  Each repair response is spliced in place after its own
+ * markers are resolved, so every section the gate did not target keeps its exact
+ * bytes.  The extra sessions' usage and cost accumulate onto the expansion, so
+ * the caller keeps pricing the whole delegation.
  *
- * A target section the draft never emitted is reported through
- * `missingSections`, never repaired: inserting a section the caller never asked
- * for would change the plan, and the update path already owns that decision
- * with its unrendered-heading rejection.
+ * A literal no table entry declares is repaired; a declared one the writer
+ * omitted is not, because the extension already knows its exact value and the
+ * gap is reported through `fidelity.missing` instead.  A target section the
+ * draft never emitted is reported through `missingSections`, never repaired:
+ * inserting a section the caller never asked for would change the plan, and the
+ * update path already owns that decision with its unrendered-heading rejection.
  */
 async function enforceLiteralFidelity(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   writerModel: Model,
   targets: readonly RepairTarget[],
+  literals: readonly ScribeLiteral[] | undefined,
   expansion: ExpandSuccess,
 ): Promise<ExpandSuccess> {
-  if (targets.length === 0) return { ...expansion, fidelity: emptyFidelityReport() };
+  const metrics: LiteralRunMetrics = {
+    resolved: 0,
+    unresolved: [],
+    repairRounds: 0,
+    repairInputTokens: 0,
+    repairOutputTokens: 0,
+  };
+  let usage = { ...expansion.usage };
+  let costUsd = expansion.costUsd;
+
+  if (targets.length === 0) {
+    const resolution = resolveLiteralPlaceholders(expansion.markdown, literals);
+    metrics.resolved = resolution.resolved;
+    metrics.unresolved = resolution.unresolved;
+    return { ...expansion, markdown: resolution.markdown, usage, costUsd, fidelity: emptyFidelityReport(), literalMetrics: metrics };
+  }
 
   // A draft that lists the literals instead of stating them is judged on its
   // prose: the gate must never accept a section because a chip spelled a
-  // literal for it.
-  let markdown = removeLiteralDumpLines(expansion.markdown);
-  let usage = { ...expansion.usage };
-  let costUsd = expansion.costUsd;
+  // literal for it.  Markers resolve first, so the repair path sees the same
+  // substituted text the plan will carry.
+  const resolution = resolveLiteralPlaceholders(removeLiteralDumpLines(expansion.markdown), literals);
+  metrics.resolved = resolution.resolved;
+  metrics.unresolved = resolution.unresolved;
+
+  let markdown = resolution.markdown;
   let report = checkFidelity(targets, splitPlanSections(markdown).sections);
   const initiallyMissing = report.missing.length;
+  const declaredKeys = new Set((literals ?? []).map(([, value]) => normalizeForMatch(value)));
+  /** The gaps a repair session could still close: the literals the table does
+   *  not declare, so a declared value the writer omitted is never re-typed. */
+  const repairableGaps = (current: FidelityReport): FidelityGap[] =>
+    current.gaps
+      .map(gap => ({
+        heading: gap.heading,
+        missing: gap.missing.filter(literal => !declaredKeys.has(normalizeForMatch(literal))),
+      }))
+      .filter(gap => gap.missing.length > 0);
+  let repairable = repairableGaps(report);
   let rounds = 0;
 
-  while (report.missing.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
+  while (repairable.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
     rounds += 1;
     const current = splitPlanSections(markdown).sections;
     const repaired = await runWriterExpansionWithRetry(
@@ -429,19 +514,21 @@ async function enforceLiteralFidelity(
       ctx,
       writerModel,
       PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT,
-      buildRepairPromptText(report.gaps, targets, current),
+      buildRepairPromptText(repairable, targets, current, literals),
     );
     // The draft that exists is worth more than a repair that never arrived.
     if ("error" in repaired) break;
 
     usage = { input: usage.input + repaired.usage.input, output: usage.output + repaired.usage.output };
     costUsd += repaired.costUsd;
+    metrics.repairInputTokens += repaired.usage.input;
+    metrics.repairOutputTokens += repaired.usage.output;
 
     // Only the gapped headings may be spliced: a repair response that invents a
     // section, re-emits one the gate did not flag, or answers with a literal
     // list instead of prose must not reach the plan.
-    const requested = new Set(report.gaps.map(gap => planHeadingKey(gap.heading)));
-    const replacements = splitPlanSections(repaired.markdown).sections.filter(
+    const requested = new Set(repairable.map(gap => planHeadingKey(gap.heading)));
+    const replacements = splitPlanSections(resolveLiteralPlaceholders(repaired.markdown, literals).markdown).sections.filter(
       section => requested.has(planHeadingKey(section.heading)) && literalDumpLines(section.text).length === 0,
     );
     const next = splicePlanSections(markdown, replacements);
@@ -449,7 +536,10 @@ async function enforceLiteralFidelity(
     if (next === markdown) break;
     markdown = next;
     report = checkFidelity(targets, splitPlanSections(markdown).sections);
+    repairable = repairableGaps(report);
   }
+
+  metrics.repairRounds = rounds;
 
   if (ctx.hasUI) {
     if (report.missing.length > 0) {
@@ -465,7 +555,24 @@ async function enforceLiteralFidelity(
     }
   }
 
-  return { ...expansion, markdown, usage, costUsd, fidelity: { ...report, repaired: rounds > 0 } };
+  return {
+    ...expansion,
+    markdown,
+    usage,
+    costUsd,
+    fidelity: { ...report, repaired: rounds > 0 },
+    literalMetrics: metrics,
+  };
+}
+
+/** Every string an initial blueprint's prose supplies, scanned for `[[id]]`
+ *  markers so a declared literal no marker references is rejected. */
+function blueprintLiteralTexts(blueprint: PlanBlueprint): string[] {
+  const texts: string[] = [blueprint.title, blueprint.context];
+  for (const [, path, reason] of blueprint.files) texts.push(path, reason);
+  for (const [, , , intent, preserve, doNot] of blueprint.steps) texts.push(intent, ...preserve, ...doNot);
+  texts.push(...blueprint.verification, ...blueprint.assumptions);
+  return texts;
 }
 
 /** Runs a short-lived, tools-free nested session on `writerModelSpec` (or the
@@ -488,6 +595,8 @@ export async function expandBlueprintToMarkdown(
   let resolvedSteps: ScribeStepResolved[];
   try {
     validateScribeBlueprint(blueprint);
+    validateLiteralTable(blueprint.literals);
+    validateLiteralUsage(blueprint.literals, blueprintLiteralTexts(blueprint));
     resolvedSteps = resolveScribeSteps(blueprint);
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -503,12 +612,23 @@ export async function expandBlueprintToMarkdown(
   const hydrated = await Promise.all(resolvedSteps.map(step => hydrateScribeStep(ctx.cwd, step)));
   const expansion = await runWriterExpansionWithRetry(pi, ctx, writerModel, WRITER_SYSTEM_PROMPT, buildPlanPromptText(blueprint, hydrated));
   if ("error" in expansion) return expansion;
-  return enforceLiteralFidelity(pi, ctx, writerModel, planFidelityTargets(blueprint, hydrated), expansion);
+  return enforceLiteralFidelity(pi, ctx, writerModel, planFidelityTargets(blueprint, hydrated), blueprint.literals, expansion);
+}
+
+/** Every string a doc blueprint's outline supplies, scanned for `[[id]]`
+ *  markers.  `path` participates — a marker may stand for the file name — but
+ *  it is never sent to the writer as JSON payload metadata. */
+function docLiteralTexts(blueprint: DocBlueprint): string[] {
+  const texts: string[] = [blueprint.title, blueprint.path];
+  for (const section of blueprint.sections) texts.push(section.heading, ...section.bullets);
+  return texts;
 }
 
 /** Runs a short-lived, tools-free nested session on `writerModelSpec` (or the
  *  `@smol` role if that fails to resolve) to expand a `DocBlueprint` outline
- *  into the final Markdown document body. Never writes to disk itself. */
+ *  into the final Markdown document body, then holds the result to the
+ *  literal-fidelity gate so a doc draft gets the same deterministic
+ *  substitution and report as a plan draft. Never writes to disk itself. */
 export async function expandDocBlueprintToMarkdown(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -520,6 +640,13 @@ export async function expandDocBlueprintToMarkdown(
     return { error: `No model resolves for writer model "${writerModelSpec}" or fallback role "@smol".` };
   }
 
+  try {
+    validateLiteralTable(blueprint.literals);
+    validateLiteralUsage(blueprint.literals, docLiteralTexts(blueprint));
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+
   if (ctx.hasUI) {
     ctx.ui.notify(
       `Scribe: delegating doc-Markdown drafting to ${writerModel.provider}/${writerModel.id} (configurable via --scribe-writer-model).`,
@@ -528,13 +655,15 @@ export async function expandDocBlueprintToMarkdown(
   }
 
   // Send only the fields the writer model needs; omit slug and path (metadata only).
-  return runWriterExpansionWithRetry(
+  const expansion = await runWriterExpansionWithRetry(
     pi,
     ctx,
     writerModel,
     DOC_WRITER_SYSTEM_PROMPT,
-    JSON.stringify({ title: blueprint.title, sections: blueprint.sections }),
+    JSON.stringify({ title: blueprint.title, sections: blueprint.sections, literals: blueprint.literals }),
   );
+  if ("error" in expansion) return expansion;
+  return enforceLiteralFidelity(pi, ctx, writerModel, docFidelityTargets(blueprint), blueprint.literals, expansion);
 }
 
 // ─── Plan updates ─────────────────────────────────────────────────────────────
@@ -630,6 +759,7 @@ export function buildPlanUpdatePromptText(
   targets.forEach((target, index) => lines.push(`${index + 1}. ${target.heading}`));
   lines.push("", "REMOVED SECTIONS (never emit these)");
   lines.push(...(drops.length === 0 ? ["- (none)"] : drops.map(heading => `- ${heading}`)));
+  lines.push(...formatLiteralTable(delta.literals));
 
   targets.forEach((target, index) => {
     lines.push("", `=== SECTION ${index + 1}: ${target.heading} ===`, "CURRENT");
@@ -639,6 +769,17 @@ export function buildPlanUpdatePromptText(
   });
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/** Every string a delta's prose supplies, scanned for `[[id]]` markers so a
+ *  declared literal no marker references is rejected. */
+function deltaLiteralTexts(delta: PlanUpdateBlueprint): string[] {
+  const texts: string[] = [];
+  if (delta.context !== undefined) texts.push(delta.context);
+  for (const [, path, reason] of delta.files ?? []) texts.push(path, reason);
+  for (const [, , , intent, preserve, doNot] of delta.steps ?? []) texts.push(intent, ...preserve, ...doNot);
+  texts.push(...(delta.verification ?? []), ...(delta.assumptions ?? []));
+  return texts;
 }
 
 /** Runs a short-lived, tools-free nested session on `writerModelSpec` (or the
@@ -670,6 +811,8 @@ export async function expandPlanUpdateToMarkdown(
   let resolvedSteps: ScribeStepResolved[];
   try {
     validateScribeBlueprint(ir, { requireSteps: false });
+    validateLiteralTable(delta.literals);
+    validateLiteralUsage(delta.literals, deltaLiteralTexts(delta));
     resolvedSteps = resolveScribeSteps(ir);
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -691,5 +834,5 @@ export async function expandPlanUpdateToMarkdown(
     buildPlanUpdatePromptText(delta, hydrated, current.sections),
   );
   if ("error" in expansion) return expansion;
-  return enforceLiteralFidelity(pi, ctx, writerModel, deltaFidelityTargets(delta, hydrated), expansion);
+  return enforceLiteralFidelity(pi, ctx, writerModel, deltaFidelityTargets(delta, hydrated), delta.literals, expansion);
 }

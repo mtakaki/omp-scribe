@@ -14,11 +14,20 @@
  * This module extracts those literals from the brief input, reports which ones
  * a draft lost (and which sections the draft never emitted at all), and
  * renders the brief that asks the writer to re-emit a section with the missing
- * strings restored verbatim.  It reads no files, spawns no sessions, tracks no
- * fence state (the caller supplies plain section text), and imports no host
- * API — the writer session (`src/writer-session.ts`) owns all of that.
+ * strings restored verbatim.
+ *
+ * It also owns the literal table: the `[[id]]` marker grammar, the validation
+ * of a planner-declared table, and the deterministic substitution that replaces
+ * each marker with the exact value the table declares — so the common case
+ * spends no repair session at all, and the extraction-and-repair path above
+ * survives only as the fallback for literals the planner never declared.
+ *
+ * It reads no files, spawns no sessions, tracks no fence state (the caller
+ * supplies plain section text), and imports no host API — the writer session
+ * (`src/writer-session.ts`) owns all of that.
  */
 import { planHeadingKey, type PlanSection } from "./plan-sections";
+import type { ScribeLiteral } from "./types";
 
 /** One plan section the gate verifies: the heading the draft must carry it
  *  under, plus every literal from the brief input that supplies it. */
@@ -61,18 +70,43 @@ export interface FidelityReport {
   gaps: FidelityGap[];
 }
 
+/** What one draft's literal handling cost: how many `[[id]]` markers the gate
+ *  substituted deterministically, the marker bodies no table entry declared,
+ *  and the repair sessions spent on the literals no table entry covered. */
+export interface LiteralRunMetrics {
+  /** Markers replaced with their declared value, counted per occurrence. */
+  resolved: number;
+  /** Marker bodies no declared id matched, de-duplicated, in reading order. */
+  unresolved: string[];
+  /** LLM repair rounds the gate ran for this draft. */
+  repairRounds: number;
+  repairInputTokens: number;
+  repairOutputTokens: number;
+}
+
+/** The result of substituting a document's `[[id]]` markers: the rewritten
+ *  text, how many markers resolved, and the bodies that stayed unresolved. */
+export interface PlaceholderResolution {
+  markdown: string;
+  /** Markers replaced, counted per occurrence. */
+  resolved: number;
+  /** Marker bodies no declared id matched, de-duplicated, in reading order. */
+  unresolved: string[];
+}
+
 export const PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT = `You re-emit plan-document sections so that every load-bearing literal the brief supplies survives verbatim. You receive one plain-text brief as the user message and must respond with ONLY the rewritten sections: for every heading the brief lists under SECTIONS TO RE-EMIT, its "## <heading>" line spelled exactly as the brief spells it, followed by that section's new body. No "# " title, no preamble, no code fences, no commentary, and never a section the brief does not request.
 
 The brief is labelled plain text:
+LITERALS - optional; when present, each line is \`[[<id>]] = <json value>\`, the exact strings the \`[[<id>]]\` markers stand for.
 SECTIONS TO RE-EMIT - the headings to emit, in the order to emit them.
 Then one block per section:
-    MISSING LITERALS - the exact strings the draft lost, one backticked bullet each.
+    MISSING LITERALS - the exact strings the draft lost; a declared one prints as \`- [[<id>]] = <json value>\`, an undeclared one as a backticked bullet.
     CURRENT - that section's present Markdown, or "(missing)" when the plan has no such section yet.
     SUPPLIED CONTENT - the brief the section was originally written from.
 
 Rules:
 1. Start from the CURRENT text and keep every sentence it already states.
-2. Fold every string listed under MISSING LITERALS back into the CURRENT sentence that discusses it, spelled character-for-character as the brief spells it and kept in backticks: never reword, abbreviate, reformat, re-case, or summarize one.
+2. Restore every string listed under MISSING LITERALS inside the CURRENT sentence that discusses it: a declared one by re-emitting its \`[[<id>]]\` marker exactly where its value belongs, an undeclared one by spelling the value character-for-character in backticks. Never reword, abbreviate, reformat, re-case, or summarize one, and never type the value a declared marker stands for.
 3. Never emit a bullet, list item, or line that consists only of the missing strings: each one belongs inside the sentence that states its role, never appended after the section's prose.
 4. When a missing string belongs to no sentence CURRENT states, return CURRENT unchanged rather than inventing a place for it.
 5. When CURRENT is "(missing)", author the section from its SUPPLIED CONTENT alone.
@@ -142,6 +176,22 @@ const DOTTED_CALL_RE = /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+[ \t]*\([^()\n]
 /** A project-relative path with an extension: `backend/src/routes/public.ts`. */
 const PATH_RE = /\b[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z][A-Za-z0-9]*\b/g;
 
+/** Longest literal-table value kept: a declared literal is an exact string,
+ *  not a document, so a longer value is a modelling mistake, not a literal. */
+export const MAX_LITERAL_VALUE_LENGTH = 1000;
+
+/** The id grammar a literal-table entry may use: a letter, then up to 15
+ *  letters, digits, underscores, or hyphens. */
+export const LITERAL_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,15}$/;
+
+/** A `[[` … `]]` marker span: a body of 0 to 64 characters other than `[`, `]`,
+ *  or a newline.  Global, for scanning and substitution. */
+const ANY_MARKER_RE = /\[\[([^\[\]\n]{0,64})\]\]/g;
+
+/** The same span without the `g` flag: `.test()` on a global regex is
+ *  stateful, so every shape check uses this one. */
+const ANY_MARKER_TEST_RE = /\[\[[^\[\]\n]{0,64}\]\]/;
+
 interface Candidate {
   /** Offset in the source string; candidates are kept in the order they read. */
   index: number;
@@ -165,6 +215,7 @@ function matches(pattern: RegExp, text: string, group: number): Candidate[] {
  *  "literal" is really a sentence). */
 function isLiteralShaped(raw: string): boolean {
   const value = raw.trim();
+  if (ANY_MARKER_TEST_RE.test(value)) return false;
   if (value.length < MIN_LITERAL_LENGTH || value.length > MAX_LITERAL_LENGTH) return false;
   if (/^\d+$/.test(value)) return false;
   if (FRAGMENT_EDGE_RE.test(value)) return false;
@@ -172,13 +223,20 @@ function isLiteralShaped(raw: string): boolean {
   return !value.includes("  ");
 }
 
-/** Whether one line is nothing but literals: it carries a backtick and, once
- *  its list marker, its backticked spans, and the separators between them are
- *  erased, nothing is left.  Deliberately line-based and fence-blind: the
- *  caller hands it plain section text. */
+/** Whether one line is nothing but literals: it carries a backtick or a
+ *  `[[id]]` marker and, once its list marker, its backticked spans, its marker
+ *  spans, and the separators between them are erased, nothing is left.
+ *  Deliberately line-based and fence-blind: the caller hands it plain section
+ *  text. */
 function isDumpLine(line: string): boolean {
-  if (!line.includes("`")) return false;
-  return line.replace(LINE_MARKER_RE, "").replace(BACKTICK_SPAN_RE, "").replace(SEPARATOR_RE, "") === "";
+  if (!line.includes("`") && !ANY_MARKER_TEST_RE.test(line)) return false;
+  return (
+    line
+      .replace(LINE_MARKER_RE, "")
+      .replace(BACKTICK_SPAN_RE, "")
+      .replace(ANY_MARKER_RE, "")
+      .replace(SEPARATOR_RE, "") === ""
+  );
 }
 
 /** The literal-only lines of `text`.  A line whose whole content is the
@@ -205,6 +263,103 @@ export function removeLiteralDumpLines(text: string): string {
  */
 export function normalizeForMatch(text: string): string {
   return text.trim().replace(/\s+/g, " ");
+}
+
+// ─── Literal table ────────────────────────────────────────────────────────────
+
+/**
+ * Merge any number of literal lists into one, in reading order: a value whose
+ * {@link normalizeForMatch} key an earlier kept value already contains is
+ * dropped, so the whole of a `` `${dir}${base}.webp` `` template wins over the
+ * `${...}` fragments it contains.
+ */
+export function mergeLiterals(...lists: readonly (readonly string[])[]): string[] {
+  const kept: string[] = [];
+  const keys: string[] = [];
+  for (const list of lists) {
+    for (const raw of list) {
+      const value = raw.trim();
+      const key = normalizeForMatch(value);
+      if (key === "" || keys.some(existing => existing.includes(key))) continue;
+      kept.push(value);
+      keys.push(key);
+    }
+  }
+  return kept;
+}
+
+/** The trimmed `[[...]]` marker bodies in `text`, in reading order and
+ *  de-duplicated under {@link String.prototype.toLowerCase}.  An empty body —
+ *  `[[]]` — is not an id, so it is not returned. */
+export function literalMarkers(text: string): string[] {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const match of text.matchAll(ANY_MARKER_RE)) {
+    const id = (match[1] ?? "").trim();
+    if (id === "") continue;
+    const key = id.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/** The `value` of every declared literal whose `id` appears as a `[[id]]`
+ *  marker in `text`, in table order.  Ids match case-insensitively. */
+export function referencedLiterals(text: string, literals: readonly ScribeLiteral[] | undefined): string[] {
+  if (literals === undefined || literals.length === 0) return [];
+  const referenced = new Set(literalMarkers(text).map(id => id.toLowerCase()));
+  return literals.filter(([id]) => referenced.has(id.toLowerCase())).map(([, value]) => value);
+}
+
+/** The brief's `LITERALS` block: a header line, then one `[[<id>]] = <json
+ *  value>` line per declared literal, then a blank line.  An empty table yields
+ *  no lines, so a caller can splice the block in unconditionally. */
+export function formatLiteralTable(literals: readonly ScribeLiteral[] | undefined): string[] {
+  if (literals === undefined || literals.length === 0) return [];
+  return [
+    "LITERALS (each marker below must appear in your response exactly where its value belongs; Scribe substitutes the exact value afterwards — never type the value yourself)",
+    ...literals.map(([id, value]) => `[[${id}]] = ${JSON.stringify(value)}`),
+    "",
+  ];
+}
+
+/**
+ * Replace every `[[id]]` marker whose body is a declared id with that literal's
+ * exact value.  An unknown or malformed span is left byte-identical and its
+ * trimmed body recorded once in `unresolved`.  Substitution is a single pass
+ * over the input text with a function callback, so a value that itself contains
+ * marker syntax is never substituted a second time.
+ */
+export function resolveLiteralPlaceholders(
+  text: string,
+  literals: readonly ScribeLiteral[] | undefined,
+): PlaceholderResolution {
+  const byId = new Map<string, string>();
+  for (const [id, value] of literals ?? []) {
+    const key = id.toLowerCase();
+    if (!byId.has(key)) byId.set(key, value);
+  }
+
+  const unresolved: string[] = [];
+  const seenUnresolved = new Set<string>();
+  let resolved = 0;
+  const markdown = text.replace(ANY_MARKER_RE, (span: string, body: string) => {
+    const trimmed = body.trim();
+    const value = byId.get(trimmed.toLowerCase());
+    if (value === undefined) {
+      if (!seenUnresolved.has(trimmed)) {
+        seenUnresolved.add(trimmed);
+        unresolved.push(trimmed);
+      }
+      return span;
+    }
+    resolved += 1;
+    return value;
+  });
+
+  return { markdown, resolved, unresolved };
 }
 
 /**
@@ -243,16 +398,7 @@ export function extractLiterals(text: string | undefined): string[] {
     .filter(candidate => isLiteralShaped(candidate.value))
     .sort((a, b) => a.index - b.index);
 
-  const kept: string[] = [];
-  const keys: string[] = [];
-  for (const candidate of candidates) {
-    const value = candidate.value.trim();
-    const key = normalizeForMatch(value);
-    if (keys.some(existing => existing.includes(key))) continue;
-    kept.push(value);
-    keys.push(key);
-  }
-  return kept;
+  return mergeLiterals(candidates.map(candidate => candidate.value));
 }
 
 /**
@@ -311,28 +457,41 @@ export function checkFidelity(
 }
 
 /**
- * The repair brief: the sections to re-emit, and per section the exact strings
- * that went missing, the section's present text (or `(missing)`), and the brief
- * input it was written from.  Only the gapped sections appear — a heading the
- * writer was not asked to touch is never mentioned, so nothing invites it to
- * rewrite one.
+ * The repair brief: the literal table (when one was declared), the sections to
+ * re-emit, and per section the exact strings that went missing — a declared one
+ * printed as its `[[<id>]]` marker and JSON value, an undeclared one backticked
+ * — the section's present text (or `(missing)`), and the brief input it was
+ * written from.  Only the gapped sections appear — a heading the writer was not
+ * asked to touch is never mentioned, so nothing invites it to rewrite one.
  */
 export function buildRepairPromptText(
   gaps: readonly FidelityGap[],
   targets: readonly RepairTarget[],
   current: readonly PlanSection[],
+  literals: readonly ScribeLiteral[] | undefined,
 ): string {
   const suppliedByKey = new Map(targets.map(target => [planHeadingKey(target.heading), target.supplied]));
   const textByKey = new Map(current.map(section => [planHeadingKey(section.heading), section.text]));
+  const declaredByValue = new Map((literals ?? []).map(([id, value]) => [normalizeForMatch(value), { id, value }]));
 
   const lines: string[] = [
+    ...formatLiteralTable(literals),
     'SECTIONS TO RE-EMIT (emit exactly these, in this order, each starting with its "## <heading>" line)',
   ];
   gaps.forEach((gap, index) => lines.push(`${index + 1}. ${gap.heading}`));
 
   gaps.forEach((gap, index) => {
     lines.push("", `=== SECTION ${index + 1}: ${gap.heading} ===`, "MISSING LITERALS");
-    lines.push(...(gap.missing.length === 0 ? ["- (none)"] : gap.missing.map(literal => `- \`${literal}\``)));
+    lines.push(
+      ...(gap.missing.length === 0
+        ? ["- (none)"]
+        : gap.missing.map(literal => {
+            const declared = declaredByValue.get(normalizeForMatch(literal));
+            return declared === undefined
+              ? `- \`${literal}\``
+              : `- [[${declared.id}]] = ${JSON.stringify(declared.value)}`;
+          })),
+    );
     lines.push("CURRENT");
     const text = textByKey.get(planHeadingKey(gap.heading));
     lines.push(text === undefined ? "(missing)" : text.trimEnd());
@@ -341,4 +500,63 @@ export function buildRepairPromptText(
   });
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * Validate a planner-declared literal table.  A no-op for an absent table; a
+ * malformed entry, an id outside {@link LITERAL_ID_RE}, two ids colliding under
+ * case folding, a blank value, and a value longer than
+ * {@link MAX_LITERAL_VALUE_LENGTH} each throw with the offending index, id, and
+ * value.  The gate cannot substitute a marker a broken table declares, so this
+ * runs before any draft is written.
+ */
+export function validateLiteralTable(literals: unknown): void {
+  if (literals === undefined) return;
+  if (!Array.isArray(literals)) throw new Error("literals: must be an array of [id, value] tuples.");
+
+  const seen = new Set<string>();
+  literals.forEach((entry: unknown, index: number) => {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      throw new Error(`literals[${index}]: must be a 2-element [id, value] tuple.`);
+    }
+    const [id, value] = entry as [unknown, unknown];
+    if (typeof id !== "string" || !LITERAL_ID_RE.test(id)) {
+      throw new Error(`literals[${index}]: id must match [A-Za-z][A-Za-z0-9_-]{0,15}, got ${JSON.stringify(id)}.`);
+    }
+    const key = id.toLowerCase();
+    if (seen.has(key)) throw new Error(`literals[${index}]: duplicate literal id ${JSON.stringify(id)}.`);
+    seen.add(key);
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`literals[${index}] (id ${JSON.stringify(id)}): value must be a non-empty string.`);
+    }
+    if (value.length > MAX_LITERAL_VALUE_LENGTH) {
+      throw new Error(`literals[${index}] (id ${JSON.stringify(id)}): value exceeds ${MAX_LITERAL_VALUE_LENGTH} characters.`);
+    }
+  });
+}
+
+/**
+ * Reject a declared literal no `[[id]]` marker in `texts` references: an
+ * unreferenced entry can never be substituted, so the planner must reference it
+ * where its value belongs or drop it.  A no-op for an absent or empty table;
+ * ids compare under case folding, matching {@link resolveLiteralPlaceholders}.
+ */
+export function validateLiteralUsage(literals: unknown, texts: readonly string[]): void {
+  if (!Array.isArray(literals) || literals.length === 0) return;
+
+  const referenced = new Set<string>();
+  for (const text of texts) {
+    for (const id of literalMarkers(text)) referenced.add(id.toLowerCase());
+  }
+
+  const unreferenced = literals
+    .filter((entry: unknown): entry is [string, unknown] => Array.isArray(entry) && typeof entry[0] === "string")
+    .map(([id]) => id)
+    .filter(id => !referenced.has(id.toLowerCase()));
+
+  if (unreferenced.length > 0) {
+    throw new Error(
+      `literals: ${unreferenced.map(id => JSON.stringify(id)).join(", ")} declared but never referenced as [[<id>]] in the blueprint's prose; reference each one where its value belongs, or drop it.`,
+    );
+  }
 }

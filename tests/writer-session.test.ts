@@ -79,6 +79,67 @@ const REPAIRED_VERIFICATION = `## Verification
 - \`bun test tests/auth-refresh.test.ts\` passes
 `;
 
+/** A blueprint that declares three literals and references each once by its
+ *  `[[id]]` marker, so a marker-emitting draft resolves all three
+ *  deterministically and needs no repair session. */
+const DECLARED_BLUEPRINT: PlanBlueprint = {
+  slug: "declared-plan",
+  title: "Declared Plan",
+  context: "The search API changed how it rejects malformed requests.",
+  files: [["D", "src/search.ts", "the search route"]],
+  steps: [["D", "~", [1, 2], "Return `[[L1]]` and reject with `[[L2]]` when `[[L3]]` is absent.", [], []]],
+  verification: [],
+  assumptions: [],
+  literals: [
+    ["L1", "/api/search-text"],
+    ["L2", "relation_not_allowed_for_entity"],
+    ["L3", "Invalid search plan"],
+  ],
+};
+
+/** The draft a marker-emitting writer returns for {@link DECLARED_BLUEPRINT}:
+ *  each of the three markers exactly once. */
+const DECLARED_DRAFT = `# Declared Plan
+
+## Context
+
+The search API changed how it rejects malformed requests.
+
+## Approach
+
+- Modify \`src/search.ts\` lines 1-2 to return \`[[L1]]\` and reject with \`[[L2]]\` when \`[[L3]]\` is absent.
+
+## Critical files & anchors
+
+- \`src/search.ts\` — the search route
+`;
+
+/** A blueprint variant whose Context section carries a declared marker, so a
+ *  draft may reword that paragraph as long as it keeps the marker. */
+const CONTEXT_MARKER_BLUEPRINT: PlanBlueprint = {
+  ...DECLARED_BLUEPRINT,
+  slug: "context-marker-plan",
+  context: "The search API now refuses malformed requests with the `[[L3]]` error.",
+};
+
+/** {@link DECLARED_DRAFT} with the Context paragraph reworded but its declared
+ *  marker kept, which must pass the gate without a repair session. */
+const REPHRASED_CONTEXT_DRAFT = DECLARED_DRAFT.replace(
+  "The search API changed how it rejects malformed requests.",
+  "Malformed search requests are now refused with the `[[L3]]` error.",
+);
+
+/** {@link DECLARED_DRAFT} with one declared marker replaced by a paraphrase of
+ *  its value: the extension knows the exact value, so it reports the gap
+ *  instead of spending a repair session. */
+const PARAPHRASED_DRAFT = DECLARED_DRAFT.replace("reject with `[[L2]]`", "reject with `relation-not-permitted`");
+
+/** {@link DECLARED_DRAFT} with one declared marker omitted outright. */
+const OMITTED_DRAFT = DECLARED_DRAFT.replace(" and reject with `[[L2]]`", "");
+
+/** {@link DECLARED_DRAFT} emitting one declared marker twice. */
+const DUPLICATE_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` from `[[L1]]`");
+
 function successScript(text: string): FakeSessionEvent[] {
   return [
     { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: text } },
@@ -560,6 +621,94 @@ describe("literal fidelity", () => {
     expect(result.markdown).toContain("`bun test tests/auth-refresh.test.ts`");
     expect(sessionCount()).toBe(2);
   });
+
+  it("substitutes every declared marker and spends no repair session", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("/api/search-text");
+    expect(result.markdown).toContain("relation_not_allowed_for_entity");
+    expect(result.markdown).toContain("Invalid search plan");
+    // Every marker the extension could substitute is gone from the draft.
+    expect(result.markdown).not.toContain("[[");
+    expect(result.literalMetrics.resolved).toBe(3);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.literalMetrics.unresolved).toEqual([]);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("reports a declared literal the writer paraphrased instead of repairing it", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(PARAPHRASED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual(["relation_not_allowed_for_entity"]);
+    expect(result.literalMetrics.resolved).toBe(2);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("reports a declared literal the writer omitted entirely, without a repair session", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(OMITTED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual(["relation_not_allowed_for_entity"]);
+    expect(result.literalMetrics.resolved).toBe(2);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("substitutes every occurrence of a marker the writer emitted twice", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DUPLICATE_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown.match(/\/api\/search-text/g)).toHaveLength(2);
+    expect(result.literalMetrics.resolved).toBe(4);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("passes a draft that rewrote the Context prose but kept its declared marker", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(REPHRASED_CONTEXT_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", CONTEXT_MARKER_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("Malformed search requests are now refused with the `Invalid search plan` error.");
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.literalMetrics.resolved).toBe(4);
+    expect(sessionCount()).toBe(1);
+  });
 });
 
 // ─── expandDocBlueprintToMarkdown ─────────────────────────────────────────────
@@ -599,6 +748,32 @@ describe("expandDocBlueprintToMarkdown", () => {
     expect(result.usage.output).toBe(60);
     expect(result.costUsd).toBeCloseTo(0.006, 8);
     expect(lastSessionDisposed()).toBe(true);
+  });
+
+  it("resolves a declared marker in a doc blueprint bullet without a repair session", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript("# Test README\n\n## Usage\n\nRun [[L1]] to bring the stack up."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const blueprint: DocBlueprint = {
+      slug: "marked-readme",
+      title: "Test README",
+      path: "README.md",
+      sections: [{ heading: "Usage", bullets: ["Run [[L1]]."] }],
+      literals: [["L1", "bun start"]],
+    };
+
+    const result = await expandDocBlueprintToMarkdown(pi, ctx, "@smol", blueprint);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("bun start");
+    expect(result.markdown).not.toContain("[[");
+    expect(result.literalMetrics.resolved).toBe(1);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(sessionCount()).toBe(1);
   });
 
   it("sends a UI notification mentioning doc-Markdown when ctx.hasUI is true", async () => {
