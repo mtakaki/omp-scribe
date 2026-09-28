@@ -87,7 +87,7 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     '"!" delete',
     '"~" modify',
     "[A-Za-z][A-Za-z0-9_-]{0,15}",
-    "1000",
+    "8000",
   ],
   propose_plan_update: [
     "slug",
@@ -101,7 +101,7 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     "3-element [id, path, reason]",
     "6-element [fileId, operation, range|null, intent, preserve[], doNot[]]",
     "[A-Za-z][A-Za-z0-9_-]{0,15}",
-    "1000",
+    "8000",
     "requires files",
   ],
   propose_doc_blueprint: [
@@ -113,7 +113,7 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     "literals",
     "2-element [id, value]",
     "[A-Za-z][A-Za-z0-9_-]{0,15}",
-    "1000",
+    "8000",
   ],
 };
 

@@ -398,7 +398,7 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 **Pattern:**
 - Zod validates input at the tool boundary (guarantees schema compliance)
 - `.describe()` provides human-readable field documentation, including the exact tuple arity and field order
-- `literals` is an optional table of 2-element `[id, value]` tuples — ids match `[A-Za-z][A-Za-z0-9_-]{0,15}` and are unique ignoring case, values are at most 1000 characters — and the planner writes the `[[<id>]]` marker where a value belongs instead of the value itself, so the extension substitutes the exact string without the writer typing it
+- `literals` is an optional table of 2-element `[id, value]` tuples — ids match `[A-Za-z][A-Za-z0-9_-]{0,15}` and are unique ignoring case, values are at most 8000 characters — and the planner writes the `[[<id>]]` marker where a value belongs instead of the value itself, so the extension substitutes the exact string without the writer typing it
 - `.min(1)` enforces non-empty arrays; `.optional()` keeps trailing fields the model may drop on a large call from failing the whole tool call
 - `.regex()` enforces slug format
 - `params as PlanBlueprintInput` is safe because Zod has already validated the shape
@@ -1063,7 +1063,7 @@ if (input.content.trim() === PLACEHOLDER_CONTENT) {
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
 1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`literals\`, \`files\`, and \`steps\` arrays:
-   literals entries are [id, value] — declare each exact string the plan must preserve character-for-character (an identifier, path, command, expression, or constant) once. id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact text, at most 1000 characters. Then reference each declared id where its value belongs by writing the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once. The extension replaces each marker with the exact value after the writer's response, so the writer never types it.
+   literals entries are [id, value] — declare each exact string the plan must preserve character-for-character (an identifier, path, command, expression, or constant) once. id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact text, at most 8000 characters. Then reference each declared id where its value belongs by writing the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once. The extension replaces each marker with the exact value after the writer's response, so the writer never types it.
    files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
    steps entries are [fileId, operation, range, intent, preserve, doNot]:
    - \`fileId\` — must match an id in \`files\`.

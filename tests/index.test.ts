@@ -2275,7 +2275,7 @@ Context sentence.
 
   /** A blueprint declaring one literal and referencing it by marker in both the
    *  Context paragraph and the step intent. */
-  function makeLiteralBlueprint(slug: string) {
+  function makeLiteralBlueprint(slug: string, value = "scribe_literal_value") {
     return {
       slug,
       title: "Fixture Plan",
@@ -2284,7 +2284,7 @@ Context sentence.
       steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[L1]]`.", [], []]],
       verification: [],
       assumptions: [],
-      literals: [["L1", "scribe_literal_value"]],
+      literals: [["L1", value]],
     };
   }
 
@@ -2346,5 +2346,32 @@ Context sentence referencing [[L1]].
     expect(stats.totalLlmRepairCalls).toBe(0);
     expect(stats.totalLlmRepairInputTokens).toBe(0);
     expect(stats.totalLlmRepairOutputTokens).toBe(0);
+  });
+
+  it("carries a declared literal well past 1000 characters through expansion", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(MARKER_DRAFT));
+    const longValue = "z".repeat(1500);
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-literal-long",
+      makeLiteralBlueprint("literal-long", longValue),
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const details = result["details"] as {
+      fidelity?: { missing: string[] };
+      literalMetrics?: { resolved: number };
+    };
+    expect(details.literalMetrics?.resolved).toBe(2);
+    expect(details.fidelity?.missing).toEqual([]);
+    expect(pendingMarkdownStore().get("literal-long")?.markdown).toContain(longValue);
   });
 });

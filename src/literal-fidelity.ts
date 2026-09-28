@@ -177,8 +177,9 @@ const DOTTED_CALL_RE = /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+[ \t]*\([^()\n]
 const PATH_RE = /\b[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z][A-Za-z0-9]*\b/g;
 
 /** Longest literal-table value kept: a declared literal is an exact string,
- *  not a document, so a longer value is a modelling mistake, not a literal. */
-export const MAX_LITERAL_VALUE_LENGTH = 1000;
+ *  not a document, so a legitimate code block or doc paragraph fits with wide
+ *  margin while a whole-document dump still trips the bound. */
+export const MAX_LITERAL_VALUE_LENGTH = 8000;
 
 /** The id grammar a literal-table entry may use: a letter, then up to 15
  *  letters, digits, underscores, or hyphens. */
@@ -505,16 +506,18 @@ export function buildRepairPromptText(
 /**
  * Validate a planner-declared literal table.  A no-op for an absent table; a
  * malformed entry, an id outside {@link LITERAL_ID_RE}, two ids colliding under
- * case folding, a blank value, and a value longer than
- * {@link MAX_LITERAL_VALUE_LENGTH} each throw with the offending index, id, and
- * value.  The gate cannot substitute a marker a broken table declares, so this
- * runs before any draft is written.
+ * case folding, and a blank value each throw with the offending index, id, and
+ * value.  Every value longer than {@link MAX_LITERAL_VALUE_LENGTH} is collected
+ * and reported in a single throw with its actual character count.  The gate
+ * cannot substitute a marker a broken table declares, so this runs before any
+ * draft is written.
  */
 export function validateLiteralTable(literals: unknown): void {
   if (literals === undefined) return;
   if (!Array.isArray(literals)) throw new Error("literals: must be an array of [id, value] tuples.");
 
   const seen = new Set<string>();
+  const oversized: Array<{ index: number; id: string; length: number }> = [];
   literals.forEach((entry: unknown, index: number) => {
     if (!Array.isArray(entry) || entry.length !== 2) {
       throw new Error(`literals[${index}]: must be a 2-element [id, value] tuple.`);
@@ -530,9 +533,20 @@ export function validateLiteralTable(literals: unknown): void {
       throw new Error(`literals[${index}] (id ${JSON.stringify(id)}): value must be a non-empty string.`);
     }
     if (value.length > MAX_LITERAL_VALUE_LENGTH) {
-      throw new Error(`literals[${index}] (id ${JSON.stringify(id)}): value exceeds ${MAX_LITERAL_VALUE_LENGTH} characters.`);
+      oversized.push({ index, id, length: value.length });
     }
   });
+
+  if (oversized.length > 0) {
+    throw new Error(
+      oversized
+        .map(
+          ({ index, id, length }) =>
+            `literals[${index}] (id ${JSON.stringify(id)}): value is ${length} characters, exceeding the ${MAX_LITERAL_VALUE_LENGTH}-character bound.`,
+        )
+        .join(" "),
+    );
+  }
 }
 
 /**

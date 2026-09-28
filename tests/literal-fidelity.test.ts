@@ -351,6 +351,7 @@ describe("validateLiteralTable", () => {
   it("accepts an absent table and a well-formed one", () => {
     expect(() => validateLiteralTable(undefined)).not.toThrow();
     expect(() => validateLiteralTable([["L1", "value"], ["L-2_x", "another"]])).not.toThrow();
+    expect(() => validateLiteralTable([["L1", "x".repeat(8000)]])).not.toThrow();
   });
 
   it("rejects a non-array table", () => {
@@ -383,8 +384,20 @@ describe("validateLiteralTable", () => {
   });
 
   it("rejects a value past the table bound", () => {
-    expect(() => validateLiteralTable([["L1", "x".repeat(1001)]])).toThrow(
-      'literals[0] (id "L1"): value exceeds 1000 characters.',
+    expect(() => validateLiteralTable([["L1", "x".repeat(8001)]])).toThrow(
+      'literals[0] (id "L1"): value is 8001 characters, exceeding the 8000-character bound.',
+    );
+  });
+
+  it("reports every oversized entry in one throw, in table order", () => {
+    expect(() =>
+      validateLiteralTable([
+        ["L1", "x".repeat(8001)],
+        ["L2", "ok"],
+        ["L3", "y".repeat(12000)],
+      ]),
+    ).toThrow(
+      'literals[0] (id "L1"): value is 8001 characters, exceeding the 8000-character bound. literals[2] (id "L3"): value is 12000 characters, exceeding the 8000-character bound.',
     );
   });
 });
