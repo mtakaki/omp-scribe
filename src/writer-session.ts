@@ -23,91 +23,81 @@ import {
   type RepairTarget,
 } from "./literal-fidelity";
 import { resolveWriterModel } from "./config";
+import { accountWriterTokens, type TokenAccounting } from "./token-accounting";
 
-export const WRITER_SYSTEM_PROMPT = `You expand a compact implementation-plan IR into a complete Markdown implementation plan. You receive one plain-text brief as the user message and must respond with ONLY the finished Markdown document: no preamble, no code fences, no commentary before or after.
+export const WRITER_SYSTEM_PROMPT = `You expand a compact implementation-plan IR into a complete Markdown plan. The user message is one labelled plain-text brief; respond with ONLY the finished Markdown document: no preamble, no code fences, no commentary.
 
-Scribe has already decoded the plan. The APPROACH STEPS are authoritative.
+The APPROACH STEPS are authoritative.
 
-The brief is labelled plain text:
-TITLE - the plan title, to become the "# " heading.
+Brief labels:
+TITLE - plan title; becomes the "# " heading.
 CONTEXT - the ask and intended end state.
-LITERALS - optional; when present, each line is \`[[<id>]] = <json value>\`, the exact values the brief's \`[[<id>]]\` markers stand for.
-APPROACH STEPS - numbered steps. Each prints:
-    the target file path
-    operation: add | delete | modify
-    lines: an inclusive line range, or "(new file)" when none applies
-    intent: a natural-language sentence describing the change
-    preserve: semicolon-separated things that must keep working (only present when non-empty)
-    do not: semicolon-separated explicit prohibitions (only present when non-empty)
-    source: the numbered current content of the referenced lines, or a parenthesised note saying nothing could be read (a file that does not exist yet, for example)
-FILES - optional "path — operation — reason" pointers, one per file the plan touches; a file no step references prints without its operation.
-VERIFICATION - optional concrete check bullets.
-ASSUMPTIONS - optional user-overridable decisions.
+LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for in the brief.
+APPROACH STEPS - numbered steps: target file path, operation (add | delete | modify), lines (an inclusive range or "(new file)"), intent (one sentence stating the change), optional preserve (semicolon-separated must-keep items), do not (semicolon-separated prohibitions), and source (the referenced lines, or a note that nothing could be read).
+FILES - optional pointers, one per touched file.
+VERIFICATION / ASSUMPTIONS - optional check bullets / user-overridable decisions.
 
-For each step:
-1. Describe only the change stated by its intent.
-2. Ground the description in the supplied source snippet.
-3. Mention the exact file and line range when available.
+Per step:
+1. Describe only the change its intent states.
+2. Ground it in the supplied source snippet.
+3. Name the file and line range when available.
 4. Treat preserve items as hard constraints.
 5. Treat do-not items as explicit prohibitions.
-6. Do not infer additional requirements from the source code.
-7. Do not invent files, implementation details, APIs, dependencies, or behavior.
-8. Do not add implementation steps that are not present in the brief.
-9. If the source conflicts with the stated intent, describe the conflict instead of guessing.
-10. Do not turn source-code observations into requirements unless the brief explicitly states them.
-11. Where the brief writes a \`[[<id>]]\` marker, emit that marker verbatim: the extension replaces it with the exact value after your response. Never write the value a marker stands for, and never invent a marker the LITERALS block does not list.
-12. Emit every marker the brief supplies, exactly where its value belongs. Never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.
+6. Infer no extra requirements from the source code.
+7. Invent no files, APIs, dependencies, details, or behavior.
+8. Add no step the brief does not list.
+9. If source and intent conflict, describe the conflict instead of guessing.
+10. Turn no source observation into a requirement unless the brief states it.
+11. Where the brief writes a \`[[<id>]]\` marker, emit it verbatim — never the value it stands for, never a marker the LITERALS block does not list; the extension substitutes the exact value afterwards.
+12. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
 
 You are a renderer, not a planner.
 
-Respond with "# <TITLE>", then these section headings in order:
+Respond with "# <TITLE>", then these headings:
 
 ## Context
-2-4 sentences, expanded tersely from the CONTEXT block.
+2-4 sentences, expanded tersely from CONTEXT.
 
 ## Approach
-One ordered bullet per APPROACH STEPS entry, in the order given. State the concrete edit — the target file, the line range or that it is a new file, and what changes, grounded in the hydrated snippet and the step's intent. Mention preserve/do-not constraints when the step lists any. Do not invent steps beyond the ones supplied.
+One bullet per APPROACH STEPS entry, in order: the concrete edit — target file, line range or new file, what changes.
 
 ## Critical files & anchors
-One bullet per FILES entry: a backtick-quoted path, then " — ", then the entry's operation when the brief prints one, then " — ", then its reason. Omit this whole section, heading included, when the brief has no such block.
+One bullet per FILES entry: backtick-quoted path, " — ", the operation when the brief prints one, " — ", reason. Omit it, heading included, when the brief has no FILES block.
 
 ## Verification
 One bullet per VERIFICATION entry.
 
 ## Assumptions & contingencies
-One bullet per ASSUMPTIONS entry. Omit this whole section, heading included, when the brief has no such block.
+One bullet per ASSUMPTIONS entry. Omit it, heading included, when the brief has no such block.
 
 Expand tersely into full sentences: add no content the brief does not supply, and alter no literal it supplies.`;
 
-export const DOC_WRITER_SYSTEM_PROMPT = `You expand compact JSON document outlines into complete Markdown documents. You receive one JSON object as the user message and must respond with ONLY the finished Markdown document: no preamble, no code fences, no commentary before or after.
+export const DOC_WRITER_SYSTEM_PROMPT = `You expand compact JSON document outlines into complete Markdown documents. Respond to the user message — one JSON object — with ONLY the finished Markdown document: no preamble, no code fences, no commentary.
 
-Prefix the document with "# <title>" using the JSON "title" field, then for each entry in the JSON "sections" array emit one "## <heading>" heading followed by the bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and never invent content beyond what the bullets supply. The JSON payload may carry a "literals" array of [id, value] tuples; a bullet that writes a \`[[<id>]]\` marker stands for that entry's exact value. Where a bullet writes a marker, emit that marker verbatim — the extension replaces it with the exact value after your response. Never write the value a marker stands for, never invent a marker the payload's "literals" array does not list, and never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.`;
+Prefix it with "# <title>" from the JSON "title", then emit one "## <heading>" per "sections" entry, followed by that entry's bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and invent nothing beyond the bullets. The payload may carry a "literals" array of [id, value] tuples: a bullet's \`[[<id>]]\` marker stands for that entry's exact value. Emit every marker verbatim where its value belongs — never the value itself, never an unlisted marker, and never a marker or literal on a line by itself.`;
 
-export const PLAN_UPDATE_WRITER_SYSTEM_PROMPT = `You revise named sections of an existing Markdown implementation plan. You receive one plain-text brief as the user message and must respond with ONLY the rewritten sections: for every heading the brief lists under REQUESTED SECTIONS, its "## <heading>" line spelled exactly as the brief spells it, followed by that section's new body. No "# " title, no preamble, no code fences, no commentary, and never a section the brief does not request.
+export const PLAN_UPDATE_WRITER_SYSTEM_PROMPT = `You revise named sections of an existing Markdown implementation plan. Respond to the user message — one labelled plain-text brief — with ONLY the rewritten sections: each requested heading's "## <heading>" line spelled as the brief spells it, then its new body. No "# " title, no preamble, no code fences, no commentary.
 
-The brief is labelled plain text:
-REQUESTED SECTIONS - the headings to emit, in the order to emit them.
+Brief labels:
+REQUESTED SECTIONS - the headings to emit, in order.
 REMOVED SECTIONS - headings the plan is dropping; never emit them.
-LITERALS - optional; when present, each line is \`[[<id>]] = <json value>\`, the exact values the brief's \`[[<id>]]\` markers stand for.
-Then one block per requested section:
-    CURRENT - that section's present Markdown, or "(no current content)" when the plan has no such section yet.
-    CHANGES - the new input for that section, in one of three shapes:
-        a paragraph - change to fold into the Context section.
-        bullets - items to fold into a checklist section (Verification, Assumptions & contingencies, Critical files & anchors). A Critical files & anchors bullet is a backtick-quoted path, then " — ", then that file's operation when the change prints one, then " — ", then its reason.
-        numbered step blocks - added or corrected Approach steps. Each prints the target file path, operation: add | delete | modify, lines: an inclusive range or "(new file)", intent: a natural-language sentence, optional preserve / do not lists, and source: the numbered current content of the referenced lines, or a parenthesised note saying nothing could be read.
+LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for.
+Per requested section:
+    CURRENT - the section's present Markdown, or "(no current content)".
+    CHANGES - the new input: a paragraph to fold into Context; bullets to fold into a checklist section (a Critical files & anchors bullet is a backtick-quoted path, the operation when printed, and the reason, " — "-separated); or step blocks for added or corrected Approach steps (target file path, operation: add | delete | modify, lines: an inclusive range or "(new file)", intent: one sentence, optional preserve / do not lists, source: the referenced lines or a note that nothing could be read).
 
 Rules:
-1. Keep every statement in CURRENT that the CHANGES block does not contradict, supersede, or forbid; never drop existing content silently.
-2. A section whose CURRENT block is "(no current content)" is written from its CHANGES block alone.
-3. Add new bullets and new steps after the existing ones, in the order given.
-4. Fold step changes into the existing step list; do not restate the steps they do not touch.
-5. For a Context section, merge the change into the existing 2-4 sentence description instead of restating the whole plan.
-6. Ground step prose in the supplied source snippet, and name the exact file and line range when available.
+1. Keep every CURRENT statement CHANGES does not contradict or forbid; drop nothing silently.
+2. Write a "(no current content)" section from its CHANGES alone.
+3. Add new bullets and steps after the existing ones, in the order given.
+4. Fold step changes into the existing list; restate no step they do not touch.
+5. Merge a Context change into the existing 2-4 sentence description; restate not the whole plan.
+6. Ground step prose in the supplied snippet; name the file and line range when available.
 7. Treat preserve items as hard constraints and do-not items as explicit prohibitions.
-8. Do not infer requirements from the source code, and do not invent files, implementation details, APIs, dependencies, behavior, or steps the brief does not supply.
-9. Do not restate, summarize, or reference any section the brief does not request.
-10. Where the brief writes a \`[[<id>]]\` marker, emit that marker verbatim: the extension replaces it with the exact value after your response. Never write the value a marker stands for, and never invent a marker the LITERALS block does not list.
-11. Emit every marker the brief supplies, exactly where its value belongs. Never emit a marker or a literal on a line by itself: each belongs inside a sentence that states its role.
+8. Infer no requirements from the source code; invent no files, details, APIs, behavior, or steps the brief does not supply.
+9. Reference no section the brief does not request.
+10. Emit any \`[[<id>]]\` marker the brief writes verbatim: the extension substitutes the exact value afterwards. Never write the value it stands for, and never invent an unlisted marker.
+11. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
 
 You are a renderer, not a planner. Expand tersely into full sentences: add no content the brief does not supply, and alter no literal it supplies.`;
 
@@ -123,6 +113,10 @@ export interface ExpandSuccess {
   costUsd: number;
   fidelity?: FidelityReport;
   literalMetrics: LiteralRunMetrics;
+  /** Real-tokenizer counts of what this expansion sent the writer model.
+   *  Present whenever a count succeeded; absent when it could not be taken, so
+   *  nothing downstream has to treat it as load-bearing. */
+  tokenAccounting?: TokenAccounting;
 }
 
 export type ExpandResult = ExpandSuccess | { error: string };
@@ -142,13 +136,16 @@ function assistantMessageText(content: readonly { type: string; text?: string }[
 /** Shared nested-session execution helper.  Creates a tools-free session on
  *  `writerModel`, sends `promptText` verbatim as the user message, accumulates
  *  the streamed Markdown response, and disposes the session in a finally block.
- *  Never touches disk. */
+ *  Never touches disk.  `snippetText` is the part of `promptText` that came
+ *  from hydrated source blocks, counted separately when the expansion is
+ *  accounted; it is never sent anywhere. */
 async function runWriterExpansion(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   writerModel: Model,
   systemPrompt: string,
   promptText: string,
+  snippetText = "",
 ): Promise<ExpandResult> {
   const sdk = pi.pi;
   const agentRegistry = new sdk.AgentRegistry();
@@ -202,11 +199,19 @@ async function runWriterExpansion(
 
     const markdown = (messageText || streamed).trim();
     if (!markdown) return { error: "Writer model returned an empty response." };
+    // Counted after the response, so a counting failure can never cost the
+    // expansion: `accountWriterTokens` degrades to `undefined`.
+    const tokenAccounting = await accountWriterTokens(writerModel, {
+      system: systemPrompt,
+      brief: promptText,
+      snippet: snippetText,
+    });
     return {
       markdown,
       model: { provider: writerModel.provider, id: writerModel.id },
       usage: writerUsage,
       costUsd: writerCostUsd,
+      tokenAccounting,
       // The gate overwrites these once it has run; a raw expansion substitutes
       // no marker and spends no repair round.
       literalMetrics: { resolved: 0, unresolved: [], repairRounds: 0, repairInputTokens: 0, repairOutputTokens: 0 },
@@ -230,13 +235,14 @@ async function runWriterExpansionWithRetry(
   writerModel: Model,
   systemPrompt: string,
   promptText: string,
+  snippetText = "",
 ): Promise<ExpandResult> {
-  const first = await runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText);
+  const first = await runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText, snippetText);
   if (!("error" in first)) return first;
   if (ctx.hasUI) {
     ctx.ui.notify(`Scribe: writer model failed (${first.error}); retrying with a fresh session.`, "warning");
   }
-  return runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText);
+  return runWriterExpansion(pi, ctx, writerModel, systemPrompt, promptText, snippetText);
 }
 
 const SCRIBE_OPERATION_LABELS: Record<ScribeOperation, string> = {
@@ -610,7 +616,17 @@ export async function expandBlueprintToMarkdown(
   }
 
   const hydrated = await Promise.all(resolvedSteps.map(step => hydrateScribeStep(ctx.cwd, step)));
-  const expansion = await runWriterExpansionWithRetry(pi, ctx, writerModel, WRITER_SYSTEM_PROMPT, buildPlanPromptText(blueprint, hydrated));
+  const expansion = await runWriterExpansionWithRetry(
+    pi,
+    ctx,
+    writerModel,
+    WRITER_SYSTEM_PROMPT,
+    buildPlanPromptText(blueprint, hydrated),
+    // The hydrated blocks are the part of the brief whose size the planner
+    // controls through its line ranges, so the diagnostic names them apart
+    // from the rest of the brief.
+    hydrated.map(entry => entry.snippet).join("\n"),
+  );
   if ("error" in expansion) return expansion;
   return enforceLiteralFidelity(pi, ctx, writerModel, planFidelityTargets(blueprint, hydrated), blueprint.literals, expansion);
 }

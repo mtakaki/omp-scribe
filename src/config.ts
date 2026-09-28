@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { Model } from "@oh-my-pi/pi-catalog";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { LiteralRunMetrics } from "./literal-fidelity";
+import type { TokenAccounting } from "./token-accounting";
 
 /** Name of the compact-blueprint tool registered by this extension. */
 export const BLUEPRINT_TOOL_NAME = "propose_plan_blueprint";
@@ -54,6 +55,11 @@ export interface ScribeConfig {
   /** Model resolved (via `ctx.models.resolve`) for the nested session that expands
    *  the JSON blueprint into Markdown. Defaults to the `@smol` role. */
   writerModel: string;
+  /** Diagnostic switch (`--scribe-token-report`): when true, the blueprint tool
+   *  logs the writer payload's per-part token counts.  The counts themselves are
+   *  measured and attached to the tool result details either way; the flag only
+   *  decides whether they reach the log. */
+  tokenReport: boolean;
 }
 
 export function registerScribeFlags(pi: ExtensionAPI): void {
@@ -66,6 +72,12 @@ export function registerScribeFlags(pi: ExtensionAPI): void {
     type: "string",
     description: "Model used to expand the compact plan/doc blueprint into the final Markdown file.",
     default: DEFAULT_WRITER_MODEL,
+  });
+  pi.registerFlag("scribe-token-report", {
+    type: "boolean",
+    description:
+      "Report the writer payload's token breakdown (system prompt, brief, hydrated snippets) on each blueprint tool result.",
+    default: false,
   });
 }
 
@@ -136,11 +148,12 @@ export async function readScribeConfig(pi: ExtensionAPI, cwd: string): Promise<S
   const writer = pi.getFlag("scribe-writer-model");
   const brainModel = typeof brain === "string" && brain.trim() ? brain.trim() : undefined;
   const flagged = typeof writer === "string" && writer.trim() ? writer.trim() : undefined;
+  const tokenReport = pi.getFlag("scribe-token-report") === true;
   if (flagged !== undefined && flagged !== DEFAULT_WRITER_MODEL) {
-    return { brainModel, writerModel: flagged };
+    return { brainModel, writerModel: flagged, tokenReport };
   }
   const persisted = await readPersistedScribeConfig(cwd);
-  return { brainModel, writerModel: persisted.writerModel ?? DEFAULT_WRITER_MODEL };
+  return { brainModel, writerModel: persisted.writerModel ?? DEFAULT_WRITER_MODEL, tokenReport };
 }
 
 /** True when the session branch says plan mode is currently on.
@@ -328,6 +341,10 @@ export interface PendingBlueprint {
    *  `writerUsage`, already reflected in `writerCostUsd`, so they carry as a
    *  breakdown rather than a second cost. */
   literalMetrics?: LiteralRunMetrics;
+  /** Real-tokenizer counts of the writer input this draft was expanded from.
+   *  Present whenever a count succeeded; absent when it could not be taken,
+   *  since a diagnostic must never fail the expansion it measures. */
+  tokenAccounting?: TokenAccounting;
 }
 
 const PENDING_STORE_KEY = "scribe-extension.pendingBlueprintStore";

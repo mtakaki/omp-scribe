@@ -51,24 +51,12 @@ import {
 } from "./stats-store";
 
 const SCRIBE_DIRECTIVE = `<scribe>
-Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`literals\`, \`files\`, and \`steps\` arrays:
-   literals entries are [id, value] — declare each exact string the plan must preserve character-for-character (an identifier, path, command, expression, or constant) once. id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact text, at most 1000 characters. Then reference each declared id where its value belongs by writing the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once. The extension replaces each marker with the exact value after the writer's response, so the writer never types it.
-   files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
-   steps entries are [fileId, operation, range, intent, preserve, doNot]:
-   - \`fileId\` — must match an id in \`files\`.
-   - \`operation\` — "+" add, "!" delete, "~" modify.
-   - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
-   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation, but reference every load-bearing literal the change depends on by its declared [[<id>]] marker.
-   - \`preserve\` — array of things that must keep working; empty array when none.
-   - \`doNot\` — array of explicit prohibitions; empty array when none.
-   - Exactly six elements per step — no extra notes, rationale, or constraints slots.
-   Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
-   Example: literals: [["A1","cookie_name"]], files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing [[A1]] cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
-2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
-3. The tool result reports literal fidelity: either "verified verbatim" or the exact literals the draft lost. Treat it as machine-checked evidence and do NOT re-read the plan file to re-verify the draft, and do NOT re-check it against your blueprint. If it still lists missing literals after the repair pass, record that gap with \`${PLAN_UPDATE_TOOL_NAME}\` (or state it in your reply) instead of reading the file back.
-4. To record a refinement after the plan file exists, do NOT rewrite the plan yourself and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug plus ONLY the fields that changed — \`literals\` (declare any new exact string here and reference it where it belongs by its [[<id>]] marker), \`context\`, \`files\` (together with \`steps\`, since every step references a file id), \`verification\`, \`assumptions\` — and optionally \`drop\`, a list of section headings to delete. Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`. The extension rewrites just those sections and splices them into the existing file; every section you did not name stays byte-identical. Omit a field to leave its section untouched, and use this instead of a second blueprint call as often as the plan needs refining.
-5. Then continue the normal \`xd://propose\` submission with that slug, as usual.
+Cost control is active for this plan turn: never compose the Markdown plan document yourself.
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown). Its parameters are documented on the tool: slug, title, context, verification, assumptions, literals, files, steps. Declare each exact string the plan must preserve character-for-character once in literals — [id, value] pairs, id matching [A-Za-z][A-Za-z0-9_-]{0,15} and unique ignoring case, value the exact text of at most 1000 characters. Where a declared value belongs, write the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once; the extension substitutes the exact value after the writer's response, so the writer never types it. Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
+2. Then call \`write\` with path \`local://<slug>-plan.md\` (the slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown before the write executes. Use \`write\` even when the plan file already exists: the draft replaces it completely, so never edit in place.
+3. The tool result reports literal fidelity — "verified verbatim", or the exact literals the draft lost — as machine-checked evidence: do NOT re-read the plan file and do NOT re-check it against your blueprint. If literals are still listed missing after the repair pass, record the gap with \`${PLAN_UPDATE_TOOL_NAME}\` instead of reading the file back.
+4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete. Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
+5. Then continue the normal \`xd://propose\` submission with that slug.
 Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>`;
 
@@ -148,7 +136,12 @@ const PLAN_MODE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDAT
  *  what it is handed verbatim, so a literal left implicit in the intent's prose
  *  may legitimately be paraphrased away. */
 const STEP_LITERAL_REQUIREMENT =
-  "Reference every load-bearing literal this step relies on by its declared [[<id>]] marker inside its intent, preserve, or doNot strings: the writer model emits every marker verbatim and the extension substitutes the exact value afterwards, so a literal left as prose or typed as a raw value may be paraphrased or mistyped.";
+  "Name every load-bearing literal this step relies on by its [[<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim.";
+
+/** `literals` parameter description shared by all three blueprint tools, so the
+ *  declaration grammar can never drift between them. */
+const LITERALS_PARAM_DESCRIPTION =
+  "Load-bearing literals: 2-element [id, value] tuples (id: [A-Za-z][A-Za-z0-9_-]{0,15}, unique ignoring case; value: the exact string to keep verbatim, max 1000 chars). Write each value's [[<id>]] marker where the value belongs, and reference every declared id; the extension substitutes it.";
 
 /** Writer identity recorded for a draft the extension produces itself: a
  *  drop-only plan update deletes sections and regenerates none, so no writer
@@ -180,7 +173,7 @@ async function readPlanArtifact(ctx: ExtensionContext, slug: string): Promise<{ 
 export default function scribe(pi: ExtensionAPI): void {
   registerScribeFlags(pi);
 
-  let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL };
+  let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL, tokenReport: false };
   let lastKnownModels: Model[] = [];
   let brainUsage = { input: 0, output: 0 };
   let brainModelId: string | undefined;
@@ -257,40 +250,40 @@ export default function scribe(pi: ExtensionAPI): void {
     name: BLUEPRINT_TOOL_NAME,
     label: "Propose Plan Blueprint",
     description:
-      `Plan mode only. Submit a compact JSON architecture blueprint instead of composing the full Markdown plan yourself: plain metadata fields plus a \`literals\` table ([id, value]), a \`files\` table ([id, path, reason]), and a \`steps\` array ([fileId, operation, range|null, intent, preserve[], doNot[]]). A separate lightweight model expands it — with each referenced line range hydrated from disk — into the final \`local://<slug>-plan.md\` document. Declare each load-bearing literal once and reference it by its \`[[<id>]]\` marker, and the extension substitutes the exact value without the writer ever typing it. Call this exactly once per plan.`,
+      `Plan mode only. Submit a compact JSON blueprint instead of composing the plan Markdown; a lightweight model expands it, hydrating each referenced line range from disk, into \`local://<slug>-plan.md\`.`,
     parameters: z.object({
       slug: z
         .string()
         .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
-        .describe("Plan slug; the final file is local://<slug>-plan.md"),
+        .describe("Plan slug; the file is local://<slug>-plan.md"),
       title: z.string().describe("Short plan title"),
-      context: z.string().describe("2-4 sentences: literal ask, need, intended end state"),
+      context: z.string().describe("2-4 sentences: the ask, need, and end state"),
       literals: z
         .array(z.array(z.unknown()).min(2).max(2))
         .optional()
         .describe(
-          "Load-bearing literals, each a 2-element [id, value] tuple. id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact string to preserve character-for-character (max 1000 chars). Write the [[<id>]] marker where that value belongs — never the value itself — and reference every declared id at least once; the extension substitutes the exact value after the writer's response. Exact shape enforced when the blueprint tool runs.",
+          LITERALS_PARAM_DESCRIPTION,
         ),
       files: z
         .array(z.array(z.unknown()).min(3).max(3))
         .min(1)
         .describe(
-          "Files the plan touches, each a 3-element [id, path, reason] array: id is a short label steps reference by; path is project-relative; reason is one line on why the file matters. Exact shape enforced when the blueprint tool runs.",
+          "Touched files: 3-element [id, path, reason] tuples. id is a short label steps reference, path is project-relative, reason is one line on why the file matters.",
         ),
       steps: z
         .array(z.array(z.unknown()).min(6).max(6))
         .min(1)
         .describe(
-          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exactly six elements — no extra notes, rationale, or constraints slots. Exact shape enforced when the blueprint tool runs. ${STEP_LITERAL_REQUIREMENT}`,
+          `Ordered load-bearing change steps: 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] tuples. operation: "+" add, "!" delete, "~" modify; range [startLine, endLine] 1-based inclusive or null; preserve/doNot are constraint lists, possibly empty. ${STEP_LITERAL_REQUIREMENT}`,
         ),
       verification: z
         .array(z.string())
         .optional()
-        .describe("Concrete input -> expected observable output checks, exact commands"),
+        .describe("Concrete input -> expected output checks"),
       assumptions: z
         .array(z.string())
         .optional()
-        .describe("User-overridable decisions with a pre-decided fallback; omit when none"),
+        .describe("User-overridable decisions, each with a fallback; omit when none"),
     }),
     approval: "read",
     strict: true,
@@ -330,7 +323,17 @@ export default function scribe(pi: ExtensionAPI): void {
         writerCostUsd: result.costUsd,
         irOutputTokens: estimateBlueprintTokens(params),
         literalMetrics: result.literalMetrics,
+        tokenAccounting: result.tokenAccounting,
       });
+
+      // The diagnostic only ever reads the accounting: the flag decides whether
+      // it reaches the log, never whether the draft is accepted.
+      if (cfg.tokenReport && result.tokenAccounting) {
+        const { system, brief, snippet, total, encoding, exact } = result.tokenAccounting;
+        pi.logger.info(
+          `[scribe-extension] writer input ${total} tokens (system ${system}, brief ${brief}, snippet ${snippet}) in ${encoding ?? "estimate"}${exact ? "" : " (approximate: no native tokenizer)"}`,
+        );
+      }
 
       showStatus(ctx, {
         kind: "plan",
@@ -356,6 +359,7 @@ export default function scribe(pi: ExtensionAPI): void {
           writerModel: `${result.model.provider}/${result.model.id}`,
           fidelity: result.fidelity,
           literalMetrics: result.literalMetrics,
+          tokenAccounting: result.tokenAccounting,
         },
       };
     },
@@ -366,7 +370,7 @@ export default function scribe(pi: ExtensionAPI): void {
     name: PLAN_UPDATE_TOOL_NAME,
     label: "Propose Plan Update",
     description:
-      `Plan mode only, once a plan file exists. Revise that plan without rewriting it: submit only the fields that changed, plus optional \`drop\` headings, and a separate lightweight model rewrites just those sections. Declare any new exact string in \`literals\` and reference it where it belongs by its \`[[<id>]]\` marker, so the extension substitutes it verbatim. The extension splices the rewritten sections into the existing \`local://<slug>-plan.md\`, leaving every section you did not name byte-identical. Prefer this over a second ${BLUEPRINT_TOOL_NAME} call.`,
+      `Plan mode only, once a plan file exists. Revise it without rewriting: submit only the changed fields plus optional \`drop\` headings, and a lightweight model rewrites just those sections and splices them into \`local://<slug>-plan.md\`.`,
     parameters: z.object({
       slug: z
         .string()
@@ -376,36 +380,36 @@ export default function scribe(pi: ExtensionAPI): void {
         .array(z.array(z.unknown()).min(2).max(2))
         .optional()
         .describe(
-          "New load-bearing literals for this revision, each a 2-element [id, value] tuple: id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact string (max 1000 chars). Write the [[<id>]] marker where that value belongs. Exact shape enforced when the tool runs.",
+          LITERALS_PARAM_DESCRIPTION,
         ),
       context: z
         .string()
         .optional()
-        .describe("Change to fold into the Context section; omit to leave Context untouched"),
+        .describe("Change to fold into Context; omit to leave it untouched"),
       files: z
         .array(z.array(z.unknown()).min(3).max(3))
         .optional()
         .describe(
-          "Files to add to the critical-files section, each a 3-element [id, path, reason] array. Send together with steps: steps reference these ids by name. Exact shape enforced when the tool runs.",
+          "Files to add to Critical files & anchors: 3-element [id, path, reason] tuples; send with steps, which reference them.",
         ),
       steps: z
         .array(z.array(z.unknown()).min(6).max(6))
         .optional()
         .describe(
-          `Change steps to fold into the Approach section, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array; requires files in the same call. Exact shape enforced when the tool runs. ${STEP_LITERAL_REQUIREMENT}`,
+          `Change steps to fold into Approach: 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] tuples; requires files in the same call. ${STEP_LITERAL_REQUIREMENT}`,
         ),
       verification: z
         .array(z.string())
         .optional()
-        .describe("Check bullets to add to the Verification section"),
+        .describe("Bullets to add to Verification"),
       assumptions: z
         .array(z.string())
         .optional()
-        .describe("Decisions to add to the assumptions section; omit when none changed"),
+        .describe("Decisions to add to Assumptions"),
       drop: z
         .array(z.string())
         .optional()
-        .describe("Headings of plan sections to delete, e.g. \"Assumptions & contingencies\""),
+        .describe("Plan section headings to delete, e.g. \"Assumptions & contingencies\""),
     }),
     approval: "read",
     strict: true,
@@ -581,28 +585,26 @@ export default function scribe(pi: ExtensionAPI): void {
     name: DOC_BLUEPRINT_TOOL_NAME,
     label: "Propose Doc Blueprint",
     description:
-      "Doc-blueprint mode only (after /scribe-doc). Submit a compact JSON outline instead of composing the full Markdown document yourself. A separate lightweight model expands it into the final document at the exact path you declare. Declare each load-bearing literal once in `literals` and reference it by its `[[<id>]]` marker so the extension substitutes the exact value. Call this exactly once per document.",
+      "Doc-blueprint mode only (after /scribe-doc). Submit a compact JSON outline; a lightweight model expands it into the file.",
     parameters: z.object({
       slug: z
         .string()
-        .regex(/^[a-z0-9][a-z0-9-]*$/)
-        .describe("kebab-case identifier for this document"),
-      title: z.string().describe("Document title (used as the H1 heading)"),
+        .regex(/^[a-z0-9][a-z0-9-]*$/),
+      title: z.string().describe("Document title (H1)"),
       path: z.string().describe("exact write target, e.g. README.md or docs/ARCHITECTURE.md"),
       sections: z
         .array(
           z.object({
             heading: z.string().describe("Section heading (H2)"),
-            bullets: z.array(z.string()).min(1).describe("Ordered bullet points for this section"),
+            bullets: z.array(z.string()).min(1),
           }),
         )
-        .min(1)
-        .describe("Ordered document sections"),
+        .min(1),
       literals: z
         .array(z.array(z.unknown()).min(2).max(2))
         .optional()
         .describe(
-          "Load-bearing literals, each a 2-element [id, value] tuple: id matches [A-Za-z][A-Za-z0-9_-]{0,15} and is unique ignoring case; value is the exact string (max 1000 chars). Write the [[<id>]] marker where that value belongs. Exact shape enforced when the tool runs.",
+          LITERALS_PARAM_DESCRIPTION,
         ),
     }),
     approval: "read",

@@ -148,7 +148,15 @@ export function resolveScribeSteps(blueprint: ScribeIrBlueprint): ScribeStepReso
 }
 
 /** Longest excerpt hydrated for one step, in lines. */
-const MAX_SNIPPET_LINES = 200;
+export const MAX_SNIPPET_LINES = 200;
+
+/** Longest excerpt hydrated for a step that names no line range and only adds
+ *  to its file.  Such a step has no range to ground the writer in, so its
+ *  snippet is the file's head — enough to carry the file's own style and
+ *  imports — and the writer has no line range to quote either way.  Ranged
+ *  steps and unranged "~"/"!" steps keep {@link MAX_SNIPPET_LINES}: their
+ *  snippet is the subject of the change, not background. */
+export const MAX_UNRANGED_SNIPPET_LINES = 40;
 
 /** Reads the lines a step references so the writer model can ground its prose
  *  in real code. `projectRoot` is the session cwd; `step.filePath` is resolved
@@ -189,7 +197,8 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   }
 
   const available = Math.min(to, lines.length);
-  const emitTo = Math.min(available, from + MAX_SNIPPET_LINES - 1);
+  const cap = step.lineRange === undefined && step.operation === "+" ? MAX_UNRANGED_SNIPPET_LINES : MAX_SNIPPET_LINES;
+  const emitTo = Math.min(available, from + cap - 1);
   const excerpt: string[] = [];
   for (let n = from; n <= emitTo; n++) excerpt.push(`${String(n).padStart(5)}| ${lines[n - 1]}`);
 

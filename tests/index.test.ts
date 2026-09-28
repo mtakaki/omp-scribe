@@ -403,6 +403,77 @@ describe("scribe: propose_plan_blueprint execute", () => {
     expect(pendingMarkdownStore().get("my-plan")!.markdown).toBe("# My Plan\n\nExpanded content.");
   });
 
+  it("attaches the writer input's token accounting to the result and the draft", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript("# My Plan\n\nExpanded content."));
+
+    const fakeApi = createFakeExtensionApi();
+    const { pi } = fakeApi;
+    (pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(pi);
+    const { ctx } = planModeContext({ cwd });
+    fakeApi.flagValues.set("scribe-token-report", true);
+    await fakeApi.emit("session_start", {}, ctx);
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+
+    const blueprint = {
+      slug: "tokens-plan",
+      title: "Tokens Plan",
+      context: "Context sentence.",
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
+      verification: ["bun test"],
+      assumptions: [],
+    };
+    const result = (await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "tcid-tokens", blueprint, ctx)) as Record<string, unknown>;
+    const accounting = (result["details"] as Record<string, unknown>)["tokenAccounting"] as {
+      system: number;
+      brief: number;
+      snippet: number;
+      total: number;
+      encoding: string | null;
+      exact: boolean;
+    };
+
+    // Counted with the host's native tokenizer, so the flag only decides whether
+    // the numbers are logged — never whether they are measured.
+    expect(accounting.exact).toBe(true);
+    expect(accounting.system).toBeGreaterThan(0);
+    expect(accounting.snippet).toBeGreaterThan(0);
+    expect(accounting.total).toBe(accounting.system + accounting.brief);
+    expect(pendingMarkdownStore().get("tokens-plan")!.tokenAccounting).toEqual(accounting);
+
+    const logged = fakeApi.infos.filter(line => line.includes("writer input"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain(`writer input ${accounting.total} tokens`);
+  });
+
+  it("leaves the result text untouched when the token report flag is off", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript("# My Plan\n\nExpanded content."));
+
+    const fakeApi = createFakeExtensionApi();
+    const { pi } = fakeApi;
+    (pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(pi);
+    const { ctx } = planModeContext({ cwd });
+    await fakeApi.emit("before_agent_start", makeTurnEvent(), ctx);
+
+    const blueprint = {
+      slug: "quiet-plan",
+      title: "Quiet Plan",
+      context: "Context sentence.",
+      files: EXAMPLE_FILES,
+      steps: EXAMPLE_STEPS,
+      verification: ["bun test"],
+      assumptions: [],
+    };
+    const result = (await fakeApi.callTool(BLUEPRINT_TOOL_NAME, "tcid-quiet", blueprint, ctx)) as Record<string, unknown>;
+
+    expect(((result["content"] as Array<{ text: string }>)[0]!.text)).toContain("Blueprint accepted");
+    expect(fakeApi.infos.filter(line => line.includes("writer input"))).toHaveLength(0);
+  });
+
   it("expands a blueprint whose optional sections were omitted", async () => {
     // Models drop trailing tool-argument keys; the three optional sections must
     // default to empty instead of failing pre-execution validation.

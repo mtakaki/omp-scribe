@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { estimateTextTokens } from "./token-accounting";
 
 /** Project-relative path for the persisted savings stats JSON file. */
 export const SAVINGS_STATS_RELATIVE_PATH = ".claude/plans/savings_stats.json";
@@ -274,12 +275,11 @@ function dataRow(label: string, value: string): string {
   return `║${content}║`;
 }
 
-/** Estimated token count of `text` at ~4 characters per token.  The package has
- *  no runtime tokenizer dependency, so this is the shared measure for both the
- *  blueprint JSON the brain emits and the Markdown document the writer returns. */
-export function estimateTextTokens(text: string): number {
-  return Math.round(text.length / 4);
-}
+/** The ~4-characters-per-token estimate the savings ledger measures with, owned
+ *  by `src/token-accounting.ts` (where it is also the explicit fallback for a
+ *  platform without the native tokenizer) and re-exported here so the ledger and
+ *  its callers keep their existing import site. */
+export { estimateTextTokens };
 
 /** Estimated token count of a compact blueprint JSON payload, at ~4 characters
  *  per token.  Subtracted from the brain's output when reporting how much it
