@@ -28,9 +28,19 @@ export interface ScribeStepResolved {
   doNot: readonly string[];
 }
 
+/** Whether the reader's own file read found the step's target: `exists` when
+ *  the file was read, `absent` when the read failed with `ENOENT` (so the
+ *  step authors a new file), and `unknown` when a read failed for any other
+ *  reason or the path escaped the project root.  The brief renders
+ *  `lines: (new file)` only for `absent`, so a file that merely could not be
+ *  read is never misreported as a creation. */
+export type ScribeFileState = "exists" | "absent" | "unknown";
+
 /** A resolved step plus the file content it references. */
 export interface HydratedScribeStep {
   step: ScribeStepResolved;
+  /** Whether the step's target file was found on disk; see {@link ScribeFileState}. */
+  fileState: ScribeFileState;
   snippet: string;
 }
 
@@ -167,7 +177,7 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   const root = resolve(projectRoot);
   const target = resolve(root, step.filePath);
   if (target !== root && !target.startsWith(root + sep)) {
-    return { step, snippet: `(no snippet: ${step.filePath} resolves outside the project root)` };
+    return { step, fileState: "unknown", snippet: `(no snippet: ${step.filePath} resolves outside the project root)` };
   }
 
   let text: string;
@@ -181,7 +191,7 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
         : code === "EISDIR"
           ? "is a directory, not a file"
           : `could not be read (${code ?? (error instanceof Error ? error.message : String(error))})`;
-    return { step, snippet: `(no snippet: ${step.filePath} ${reason})` };
+    return { step, fileState: code === "ENOENT" ? "absent" : "unknown", snippet: `(no snippet: ${step.filePath} ${reason})` };
   }
 
   const lines = text.split(/\r?\n/);
@@ -192,6 +202,7 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   if (from > lines.length) {
     return {
       step,
+      fileState: "exists",
       snippet: `(no snippet: ${step.filePath} has only ${lines.length} lines, but lines ${from}-${to} were requested)`,
     };
   }
@@ -205,5 +216,5 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   const notes: string[] = [];
   if (to > lines.length) notes.push(`lines ${lines.length + 1}-${to} were requested but ${step.filePath} ends at line ${lines.length}`);
   if (available > emitTo) notes.push(`${available - emitTo} further lines omitted`);
-  return { step, snippet: notes.length === 0 ? excerpt.join("\n") : `${excerpt.join("\n")}\n(${notes.join("; ")})` };
+  return { step, fileState: "exists", snippet: notes.length === 0 ? excerpt.join("\n") : `${excerpt.join("\n")}\n(${notes.join("; ")})` };
 }

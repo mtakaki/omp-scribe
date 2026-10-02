@@ -1009,6 +1009,34 @@ describe("scribe: propose_plan_update", () => {
     expect(entry!.deltaDocOutputTokens).toBe(0);
   });
 
+  it("regenerates a heading named in both drop and the supplying field", async () => {
+    const artifactsDir = join(cwd, "artifacts");
+    await writeArtifact(artifactsDir, "auth-refresh-plan.md", DISK_PLAN);
+
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(VERIFICATION_SECTION));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd, artifactsDir });
+
+    const result = (await fakeApi.callTool(
+      PLAN_UPDATE_TOOL_NAME,
+      "tcid-update-regen",
+      { slug: "auth-refresh", drop: ["Verification"], verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const details = result["details"] as { rewritten: string[]; dropped: string[] };
+    expect(details.rewritten).toEqual(["Verification"]);
+    // The heading is regenerated from scratch, so it is not reported as dropped
+    // and the replacement still lands in place.
+    expect(details.dropped).toEqual([]);
+    expect(pendingMarkdownStore().get("auth-refresh")!.markdown).toBe(UPDATED_PLAN);
+  });
+
   it("finds the plan under the OS temp root when the session has no artifacts dir", async () => {
     const sessionId = `s-${randomUUID()}`;
     const root = join(tmpdir(), "omp-local", sessionId);
@@ -2263,6 +2291,7 @@ Context sentence.
     const text = (result["content"] as Array<{ text: string }>)[0]!.text;
     expect(text).toContain("`src/example.ts`");
     expect(text).toContain(PLAN_UPDATE_TOOL_NAME);
+    expect(text).toContain("repair pass could not restore");
     expect(text).not.toContain("verified verbatim");
     const details = result["details"] as { fidelity?: { missing: string[] } };
     expect(details.fidelity?.missing).toEqual(["src/example.ts"]);

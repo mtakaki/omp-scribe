@@ -1155,31 +1155,36 @@ blueprint.steps.forEach((entry, index) => {
 The literals a brief carries are a contract the cheap writer honors only probabilistically, so a literal the planner declares in the brief's table is substituted deterministically from the `[[id]]` marker the draft leaves behind, and the remaining draft is verified against the brief and repaired within a bounded budget instead of trusted:
 
 ```typescript
-const resolution = resolveLiteralPlaceholders(removeLiteralDumpLines(expansion.markdown), literals);
+const resolution = resolveLiteralPlaceholders(expansion.markdown, literals);   // the plan keeps the writer's own text, only its markers substituted
 const metrics: LiteralRunMetrics = { resolved: resolution.resolved, unresolved: resolution.unresolved, repairRounds: 0, repairInputTokens: 0, repairOutputTokens: 0 };
-const declaredKeys = new Set((literals ?? []).map(([, value]) => normalizeForMatch(value)));
+const gateSections = (text: string): PlanSection[] => splitPlanSections(removeLiteralDumpLines(text)).sections;   // the strip feeds the check, never the plan
 let markdown = resolution.markdown;
-let report = checkFidelity(targets, splitPlanSections(markdown).sections);
-const repairableGaps = (current: FidelityReport): FidelityGap[] => current.gaps
-  .map(gap => ({ heading: gap.heading, missing: gap.missing.filter(literal => !declaredKeys.has(normalizeForMatch(literal))) }))
-  .filter(gap => gap.missing.length > 0);   // a declared literal the writer omitted is reported, never re-typed
-let repairable = repairableGaps(report);
+let report = checkFidelity(targets, gateSections(markdown));
+const repairableGaps = (current: FidelityReport, sections: readonly PlanSection[]): FidelityGap[] => {
+  const haystack = normalizeForMatch(sections.map(section => section.text).join("\n"));
+  return current.gaps
+    .map(gap => ({ heading: gap.heading, missing: gap.missing.filter(literal => !haystack.includes(normalizeForMatch(literal))) }))
+    .filter(gap => gap.missing.length > 0);   // declared literals included; one already elsewhere in the plan is not lost
+};
+let repairable = repairableGaps(report, gateSections(markdown));
 let rounds = 0;
 while (repairable.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
   rounds += 1;
-  const repaired = await runWriterExpansionWithRetry(pi, ctx, writerModel, PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT, buildRepairPromptText(repairable, targets, current, literals));
+  const repaired = await runWriterExpansionWithRetry(pi, ctx, writerModel, PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT, buildRepairPromptText(repairable, targets, gateSections(markdown), literals));
   if ("error" in repaired) break;
-  markdown = splicePlanSections(markdown, replacementsFor(repaired, repairable));  // markers resolved first; flagged headings only
-  report = checkFidelity(targets, splitPlanSections(markdown).sections);
-  repairable = repairableGaps(report);
+  const next = splicePlanSections(markdown, replacementsFor(repaired, repairable));  // markers resolved first; flagged headings only; a dump line is refused
+  if (next === markdown) break;
+  markdown = next;
+  report = checkFidelity(targets, gateSections(markdown));
+  repairable = repairableGaps(report, gateSections(markdown));
 }
 return { ...expansion, markdown, usage: accumulated, costUsd, fidelity: { ...report, repaired: rounds > 0 }, literalMetrics: { ...metrics, repairRounds: rounds } };
 ```
 
 **Pattern:**
 - Post-conditions are verified rather than assumed: the literals come from the brief input, never from what the draft claims to cover
-- The deterministic path runs first: `resolveLiteralPlaceholders` substitutes every `[[id]]` marker over the dump-stripped draft, so a declared literal reaches the plan character-for-character and spends no repair session
-- Only the literals no table entry declares are repaired, and the repairable set is recomputed from each fresh report: a declared literal the writer omitted is reported through `fidelity.missing` instead of being re-typed by an LLM, because the extension already knows its exact value
+- The deterministic path runs first: `resolveLiteralPlaceholders` substitutes every `[[id]]` marker over the writer's own draft, so a declared literal reaches the plan character-for-character — the gate never deletes a line the writer emitted, and the literal-only-line strip feeds only the haystack it compares
+- Every literal absent from that whole haystack is repairable, declared ones included, and the repairable set is recomputed from each fresh report: a declared literal is restored by re-placing its `[[id]]` marker (the extension substitutes the exact value afterwards, so no LLM retypes it), and only a literal the repair pass could not restore — or one that already survives elsewhere in the plan — is reported through `fidelity.missing`
 - `buildRepairPromptText` takes the table as its fourth argument, so a repair brief shows a missing declared literal as its `[[id]]` marker and JSON value while a literal no entry declares keeps the backticked value
 - Repair is bounded (`MAX_FIDELITY_REPAIR_ROUNDS`; `0` degrades to report-only) and reports its residue instead of throwing, so a usable draft is never lost to an unfixable gap
 - Only the flagged sections are spliced back, so a repair response cannot rewrite a section the gate did not name; the replacement's own markers are resolved before it lands

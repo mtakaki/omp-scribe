@@ -13,7 +13,8 @@
  */
 import type { Model } from "@oh-my-pi/pi-catalog";
 import { resolveTokenCounter, tokenBreakdown, type TokenCounter } from "../src/token-accounting";
-import { WRITER_SYSTEM_PROMPT } from "../src/writer-session";
+import { DOC_WRITER_SYSTEM_PROMPT, PLAN_UPDATE_WRITER_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT } from "../src/writer-session";
+import { capturePlanDirective, registeredToolTexts } from "../tests/support/schema-text";
 import {
   loadTokenFixture,
   loadTokenFixtureWithUncappedSnippets,
@@ -54,6 +55,26 @@ for (const { label, model } of ENCODINGS) {
   counters.push({ label, counter });
 }
 
+// `--examples` prints the fixture's own plan at both ends of the pipeline: the
+// expanded Markdown body the writer returned and the tuple JSON the planner
+// emitted, verbatim, each with its character and token counts. The README's
+// plan-versus-blueprint example is these two blocks.
+if (process.argv.includes("--examples")) {
+  const body = fixture.planBody;
+  const json = tupleJson(fixture.plan);
+  const bodyCounts = counters.map(entry => `${entry.counter.count(body)} ${entry.label}`).join(", ");
+  const jsonCounts = counters.map(entry => `${entry.counter.count(json)} ${entry.label}`).join(", ");
+  console.log("Plan-body versus blueprint — the same plan at both ends of the pipeline\n");
+  console.log(`expanded plan body — ${body.length} characters — ${bodyCounts} tokens`);
+  console.log("");
+  console.log(body.trimEnd());
+  console.log("");
+  console.log(`planner payload (tuple JSON) — ${json.length} characters — ${jsonCounts} tokens`);
+  console.log("");
+  console.log(json);
+  process.exit(0);
+}
+
 const stages: ReadonlyArray<{ label: string; text: string }> = [
   { label: "tuple JSON (planner payload)", text: tupleJson(fixture.plan) },
   { label: "prose equivalent", text: renderProseEquivalent(fixture.plan) },
@@ -63,6 +84,7 @@ const stages: ReadonlyArray<{ label: string; text: string }> = [
   { label: "  of which hydrated snippets", text: fixture.snippetText },
   { label: "writer brief (200-line cap)", text: capped.brief },
   { label: "  of which snippets (200-line cap)", text: capped.snippetText },
+  { label: "expanded plan body", text: fixture.planBody },
 ];
 
 const countsByStage = stages.map(stage => {
@@ -111,6 +133,34 @@ console.log(`  tuple JSON ${jsonTokens} vs prose ${proseTokens} = ${jsonOverPros
 console.log(`  writer input ${totals[primaryIndex]} tokens (system ${countsByStage[3].counts[primaryIndex]}, brief ${briefTokens}, snippets ${snippetTokens})`);
 console.log(`  recorded pre-change baseline ${RECORDED_PRE_CHANGE_WRITER_INPUT} -> reduction ${(reduction * 100).toFixed(1)}% (required ${(REQUIRED_REDUCTION * 100).toFixed(0)}%)`);
 console.log(`  on the same fixture, the 200-line snippet cap gave ${cappedSnippetTokens} snippet tokens vs ${snippetTokens} now: brief ${cappedBriefTokens} -> ${briefTokens}, writer input reduction ${(capReduction * 100).toFixed(1)}%`);
+
+// ─── Planner surface ────────────────────────────────────────────────────────
+// Everything the expensive model pays for before it drafts: the plan-mode
+// directive injected into its system prompt, the three tool schemas it reads,
+// and the writer system prompts. `tests/token-economics.test.ts` ceilings these;
+// this prints the numbers the ceilings are recorded from.
+const plannerSurface: ReadonlyArray<{ label: string; text: string }> = [
+  { label: "plan-mode directive", text: await capturePlanDirective() },
+  { label: "writer system prompt", text: WRITER_SYSTEM_PROMPT },
+  { label: "update writer system prompt", text: PLAN_UPDATE_WRITER_SYSTEM_PROMPT },
+  { label: "doc writer system prompt", text: DOC_WRITER_SYSTEM_PROMPT },
+  ...registeredToolTexts().map(tool => ({ label: `tool: ${tool.name}`, text: `${tool.description}\n${tool.parameters}` })),
+];
+
+const surfaceLabelWidth = Math.max(...plannerSurface.map(entry => entry.label.length), "planner surface".length);
+const surfaceColumnWidths = counters.map((entry, index) => {
+  const values = plannerSurface.map(surface => String(counters[index]!.counter.count(surface.text)));
+  return Math.max(entry.label.length, ...values.map(value => value.length)) + 2;
+});
+const surfaceRow = (label: string, cells: readonly string[]): string =>
+  `${label.padEnd(surfaceLabelWidth)}${cells.map((cell, index) => pad(cell, surfaceColumnWidths[index]!)).join("")}`;
+
+console.log("\nPlanner surface — what the expensive model reads before it drafts (native tokenizer)\n");
+console.log(surfaceRow("planner surface", counters.map(entry => entry.label)));
+console.log("-".repeat(surfaceLabelWidth + surfaceColumnWidths.reduce((sum, value) => sum + value, 0)));
+for (const surface of plannerSurface) {
+  console.log(surfaceRow(surface.label, counters.map(entry => String(entry.counter.count(surface.text)))));
+}
 
 const failed = [
   reduction < REQUIRED_REDUCTION ? `writer input reduction ${(reduction * 100).toFixed(1)}% < ${(REQUIRED_REDUCTION * 100).toFixed(0)}%` : "",

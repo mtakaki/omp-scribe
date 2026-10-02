@@ -33,7 +33,7 @@ Brief labels:
 TITLE - plan title; becomes the "# " heading.
 CONTEXT - the ask and intended end state.
 LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for in the brief.
-APPROACH STEPS - numbered steps: target file path, operation (add | delete | modify), lines (an inclusive range or "(new file)"), intent (one sentence stating the change), optional preserve (semicolon-separated must-keep items), do not (semicolon-separated prohibitions), and source (the referenced lines, or a note that nothing could be read).
+APPROACH STEPS - numbered steps: target file path, operation (add | delete | modify), lines (an inclusive range, or "(new file)" only when the brief marks the step as creating the file, or "(no range given)" otherwise), intent (one sentence stating the change), optional preserve (semicolon-separated must-keep items), do not (semicolon-separated prohibitions), and source (the referenced lines, or a note that nothing could be read).
 FILES - optional pointers, one per touched file.
 VERIFICATION / ASSUMPTIONS - optional check bullets / user-overridable decisions.
 
@@ -50,6 +50,8 @@ Per step:
 10. Turn no source observation into a requirement unless the brief states it.
 11. Where the brief writes a \`[[<id>]]\` marker, emit it verbatim — never the value it stands for, never a marker the LITERALS block does not list; the extension substitutes the exact value afterwards.
 12. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
+13. Call a step a new file only when its lines label reads "(new file)"; when it reads "(no range given)", the step edits a file that already exists, so never call it new or describe creating it.
+14. State each fact once: never repeat a sentence, clause, or list item.
 
 You are a renderer, not a planner.
 
@@ -59,7 +61,7 @@ Respond with "# <TITLE>", then these headings:
 2-4 sentences, expanded tersely from CONTEXT.
 
 ## Approach
-One bullet per APPROACH STEPS entry, in order: the concrete edit — target file, line range or new file, what changes.
+One bullet per APPROACH STEPS entry, in order: the concrete edit — target file, line range, new file, or nothing when the brief gives no range, and what changes.
 
 ## Critical files & anchors
 One bullet per FILES entry: backtick-quoted path, " — ", the operation when the brief prints one, " — ", reason. Omit it, heading included, when the brief has no FILES block.
@@ -84,11 +86,11 @@ REMOVED SECTIONS - headings the plan is dropping; never emit them.
 LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for.
 Per requested section:
     CURRENT - the section's present Markdown, or "(no current content)".
-    CHANGES - the new input: a paragraph to fold into Context; bullets to fold into a checklist section (a Critical files & anchors bullet is a backtick-quoted path, the operation when printed, and the reason, " — "-separated); or step blocks for added or corrected Approach steps (target file path, operation: add | delete | modify, lines: an inclusive range or "(new file)", intent: one sentence, optional preserve / do not lists, source: the referenced lines or a note that nothing could be read).
+    CHANGES - the new input: a paragraph to fold into Context; bullets to fold into a checklist section (a Critical files & anchors bullet is a backtick-quoted path, the operation when printed, and the reason, " — "-separated); or step blocks for added or corrected Approach steps (target file path, operation: add | delete | modify, lines: an inclusive range, "(new file)" only when the brief marks the step as creating the file, or "(no range given)" otherwise, intent: one sentence, optional preserve / do not lists, source: the referenced lines or a note that nothing could be read).
 
 Rules:
 1. Keep every CURRENT statement CHANGES does not contradict or forbid; drop nothing silently.
-2. Write a "(no current content)" section from its CHANGES alone.
+2. Write a "(no current content)" section from its CHANGES alone; a requested heading also listed under REMOVED SECTIONS (so you are regenerating that section from scratch) is authored the same way.
 3. Add new bullets and steps after the existing ones, in the order given.
 4. Fold step changes into the existing list; restate no step they do not touch.
 5. Merge a Context change into the existing 2-4 sentence description; restate not the whole plan.
@@ -98,6 +100,8 @@ Rules:
 9. Reference no section the brief does not request.
 10. Emit any \`[[<id>]]\` marker the brief writes verbatim: the extension substitutes the exact value afterwards. Never write the value it stands for, and never invent an unlisted marker.
 11. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
+12. Call a step a new file only when its lines label reads "(new file)"; when it reads "(no range given)", the step edits a file that already exists, so never call it new or describe creating it.
+13. State each fact once: never repeat a sentence, clause, or list item.
 
 You are a renderer, not a planner. Expand tersely into full sentences: add no content the brief does not supply, and alter no literal it supplies.`;
 
@@ -253,8 +257,11 @@ const SCRIBE_OPERATION_LABELS: Record<ScribeOperation, string> = {
 
 /** The operation label to print for each file a step references, keyed by file
  *  id.  A file any step modifies is `modify`, else one any step deletes is
- *  `delete`, else the file is new.  A file no step references is absent: there
- *  is no operation to state, so its bullet keeps the bare path and reason. */
+ *  `delete`, else the file is added.  The label states the operation alone: the
+ *  `(new file)` fact belongs to the step's `lines` label, where hydration
+ *  decides it, so a Critical files bullet never contradicts an Approach bullet.
+ *  A file no step references is absent: there is no operation to state, so its
+ *  bullet keeps the bare path and reason. */
 function fileOperationLabels(files: readonly ScribeFile[], steps: readonly ScribeStep[]): Map<string, string> {
   const byFileId = new Map<string, ScribeOperation>();
   for (const [fileId, operation] of steps) {
@@ -266,10 +273,7 @@ function fileOperationLabels(files: readonly ScribeFile[], steps: readonly Scrib
   for (const [id] of files) {
     const operation = byFileId.get(id);
     if (operation === undefined) continue;
-    labels.set(
-      id,
-      operation === "+" ? `${SCRIBE_OPERATION_LABELS["+"]} (new file)` : SCRIBE_OPERATION_LABELS[operation],
-    );
+    labels.set(id, SCRIBE_OPERATION_LABELS[operation]);
   }
   return labels;
 }
@@ -277,11 +281,15 @@ function fileOperationLabels(files: readonly ScribeFile[], steps: readonly Scrib
 /** Renders one decoded step as the labelled block both writer prompts describe:
  *  its numbered target path, operation, line range, intent, constraints, and the
  *  lines the extension hydrated for it. */
-function renderStepBlock(index: number, { step, snippet }: HydratedScribeStep): string[] {
+function renderStepBlock(index: number, { step, fileState, snippet }: HydratedScribeStep): string[] {
   const lines = [
     `${index + 1}. ${step.filePath}`,
     `   operation: ${SCRIBE_OPERATION_LABELS[step.operation]}`,
-    step.lineRange ? `   lines: ${step.lineRange.start}-${step.lineRange.end}` : "   lines: (new file)",
+    step.lineRange
+      ? `   lines: ${step.lineRange.start}-${step.lineRange.end}`
+      : fileState === "absent"
+        ? "   lines: (new file)"
+        : "   lines: (no range given)",
     `   intent: ${step.intent}`,
   ];
   if (step.preserve.length > 0) lines.push(`   preserve: ${step.preserve.join("; ")}`);
@@ -456,12 +464,19 @@ function emptyFidelityReport(): FidelityReport {
  * bytes.  The extra sessions' usage and cost accumulate onto the expansion, so
  * the caller keeps pricing the whole delegation.
  *
- * A literal no table entry declares is repaired; a declared one the writer
- * omitted is not, because the extension already knows its exact value and the
- * gap is reported through `fidelity.missing` instead.  A target section the
+ * Every literal gap a repair session can close is repairable, declared ones
+ * included: the repair brief prints a declared literal as its `[[<id>]]` marker
+ * and the extension substitutes the exact value afterwards, so restoring a
+ * marker never asks the writer to retype the value.  A gap is skipped only when
+ * the literal already survives elsewhere in the plan.  A target section the
  * draft never emitted is reported through `missingSections`, never repaired:
  * inserting a section the caller never asked for would change the plan, and the
  * update path already owns that decision with its unrendered-heading rejection.
+ *
+ * The gate never mutates the plan: the markers are resolved over the writer's
+ * own text, and the literal-only-line strip is applied to the haystack it
+ * compares, so a draft's bullet survives into the plan even when the gate
+ * refuses to count it as carrying its literal.
  */
 async function enforceLiteralFidelity(
   pi: ExtensionAPI,
@@ -488,33 +503,43 @@ async function enforceLiteralFidelity(
     return { ...expansion, markdown: resolution.markdown, usage, costUsd, fidelity: emptyFidelityReport(), literalMetrics: metrics };
   }
 
-  // A draft that lists the literals instead of stating them is judged on its
-  // prose: the gate must never accept a section because a chip spelled a
-  // literal for it.  Markers resolve first, so the repair path sees the same
-  // substituted text the plan will carry.
-  const resolution = resolveLiteralPlaceholders(removeLiteralDumpLines(expansion.markdown), literals);
+  // Markers resolve over the draft exactly as it stands, so the returned plan
+  // is the writer's own text with its declared values substituted — the gate
+  // never deletes a line the writer emitted.  A draft that lists the literals
+  // instead of stating them is still judged on its prose: `removeLiteralDumpLines`
+  // is applied to the gate's haystack alone, so a literal-only line cannot
+  // satisfy the check even though it stays in the plan.
+  const resolution = resolveLiteralPlaceholders(expansion.markdown, literals);
   metrics.resolved = resolution.resolved;
   metrics.unresolved = resolution.unresolved;
 
   let markdown = resolution.markdown;
-  let report = checkFidelity(targets, splitPlanSections(markdown).sections);
+  /** The sections the gate compares: the draft with its literal-only lines
+   *  removed, re-derived after every repair round.  The repair brief is shown
+   *  the same text, so a dump line cannot be copied forward. */
+  const gateSections = (text: string): PlanSection[] => splitPlanSections(removeLiteralDumpLines(text)).sections;
+  let report = checkFidelity(targets, gateSections(markdown));
   const initiallyMissing = report.missing.length;
-  const declaredKeys = new Set((literals ?? []).map(([, value]) => normalizeForMatch(value)));
-  /** The gaps a repair session could still close: the literals the table does
-   *  not declare, so a declared value the writer omitted is never re-typed. */
-  const repairableGaps = (current: FidelityReport): FidelityGap[] =>
-    current.gaps
+  /** The gaps a repair session could still close: a literal absent from the
+   *  whole gate haystack.  A literal that already survives elsewhere in the
+   *  plan is not lost, so re-emitting it in one flagged section would buy
+   *  nothing.  Declared values are repairable too — the repair brief prints
+   *  their `[[<id>]]` marker, and the extension substitutes the exact value. */
+  const repairableGaps = (current: FidelityReport, sections: readonly PlanSection[]): FidelityGap[] => {
+    const haystack = normalizeForMatch(sections.map(section => section.text).join("\n"));
+    return current.gaps
       .map(gap => ({
         heading: gap.heading,
-        missing: gap.missing.filter(literal => !declaredKeys.has(normalizeForMatch(literal))),
+        missing: gap.missing.filter(literal => !haystack.includes(normalizeForMatch(literal))),
       }))
       .filter(gap => gap.missing.length > 0);
-  let repairable = repairableGaps(report);
+  };
+  let repairable = repairableGaps(report, gateSections(markdown));
   let rounds = 0;
 
   while (repairable.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
     rounds += 1;
-    const current = splitPlanSections(markdown).sections;
+    const current = gateSections(markdown);
     const repaired = await runWriterExpansionWithRetry(
       pi,
       ctx,
@@ -541,8 +566,8 @@ async function enforceLiteralFidelity(
     // A round that changes nothing will change nothing on the next try either.
     if (next === markdown) break;
     markdown = next;
-    report = checkFidelity(targets, splitPlanSections(markdown).sections);
-    repairable = repairableGaps(report);
+    report = checkFidelity(targets, gateSections(markdown));
+    repairable = repairableGaps(report, gateSections(markdown));
   }
 
   metrics.repairRounds = rounds;
@@ -726,6 +751,15 @@ export function planUpdateDrops(delta: PlanUpdateBlueprint): string[] {
   return drops;
 }
 
+/** The plan-section headings a delta asks to delete *and* does not supply:
+ *  exactly the sections the plan drops.  A heading a delta lists in `drop` and
+ *  also supplies through a field is regenerated from scratch rather than
+ *  deleted, so it never appears in this list. */
+export function planUpdateRemovals(delta: PlanUpdateBlueprint): string[] {
+  const supplied = new Set(planUpdateHeadings(delta).map(planHeadingKey));
+  return planUpdateDrops(delta).filter(heading => !supplied.has(planHeadingKey(heading)));
+}
+
 /** The CHANGES block for one requested section: the delta input the writer must
  *  fold into that section's current text. */
 function planUpdateChangeLines(
@@ -766,7 +800,10 @@ export function buildPlanUpdatePromptText(
   currentSections: readonly PlanSection[],
 ): string {
   const targets = PLAN_UPDATE_TARGETS.filter(target => deltaSupplies(delta, target.field));
-  const drops = planUpdateDrops(delta);
+  const removals = planUpdateRemovals(delta);
+  /** A heading the delta both drops and supplies is regenerated from scratch:
+   *  its CURRENT block shows no text to fold into. */
+  const regenerated = new Set(planUpdateDrops(delta).map(planHeadingKey));
   const currentByKey = new Map(currentSections.map(section => [planHeadingKey(section.heading), section.text]));
 
   const lines: string[] = [
@@ -774,13 +811,14 @@ export function buildPlanUpdatePromptText(
   ];
   targets.forEach((target, index) => lines.push(`${index + 1}. ${target.heading}`));
   lines.push("", "REMOVED SECTIONS (never emit these)");
-  lines.push(...(drops.length === 0 ? ["- (none)"] : drops.map(heading => `- ${heading}`)));
+  lines.push(...(removals.length === 0 ? ["- (none)"] : removals.map(heading => `- ${heading}`)));
   lines.push(...formatLiteralTable(delta.literals));
 
   targets.forEach((target, index) => {
     lines.push("", `=== SECTION ${index + 1}: ${target.heading} ===`, "CURRENT");
-    const current = currentByKey.get(planHeadingKey(target.heading));
-    lines.push(current === undefined ? "(no current content)" : current.trimEnd());
+    const key = planHeadingKey(target.heading);
+    const current = currentByKey.get(key);
+    lines.push(regenerated.has(key) || current === undefined ? "(no current content)" : current.trimEnd());
     lines.push("CHANGES", ...planUpdateChangeLines(delta, target.field, steps));
   });
 

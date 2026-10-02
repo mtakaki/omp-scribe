@@ -14,11 +14,10 @@
  * reason instead of failing on an estimate.
  */
 import { describe, expect, it } from "bun:test";
-import { createFakeExtensionApi, createFakeExtensionContext, modeChangeEntry } from "./support/fake-extension-api";
 import { resolveTokenCounter } from "../src/token-accounting";
 import { DOC_WRITER_SYSTEM_PROMPT, PLAN_UPDATE_WRITER_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT } from "../src/writer-session";
 import { loadTokenFixture, renderProseEquivalent, tupleJson } from "./support/token-fixture";
-import scribe from "../src/index";
+import { capturePlanDirective, registeredToolTexts } from "./support/schema-text";
 
 /** Encoding every ceiling below is stated in. */
 const ENCODING = "deepseek-v3";
@@ -35,26 +34,33 @@ const tokenIt = skipReason === undefined ? it : it.skip;
 const tokens = (text: string): number => counter.count(text);
 
 /** Ceilings, in `deepseek-v3` tokens, for the three registered tool schemas
- *  (description plus every parameter name and `describe`, deduplicated). Each is
- *  70% of the pre-change measurement recorded beside it, taken from the same
- *  extraction at the commit this budget was introduced. */
+ *  (description plus every parameter name and `describe`, deduplicated).
+ *  `before` records the size the ceiling was last re-recorded from — the
+ *  pre-change measurement at the commit the budget was introduced, or the newly
+ *  measured size for a schema whose text legitimately grew — and `ceiling` is
+ *  110% of it rounded up to the next multiple of 5. A budget is a ceiling, not a
+ *  pin: grow one only by re-recording the measurement deliberately. */
 const TOOL_TEXT_BUDGETS: Readonly<Record<string, { ceiling: number; before: number }>> = {
   propose_plan_blueprint: { ceiling: 412, before: 589 },
-  propose_plan_update: { ceiling: 326, before: 466 },
+  // Re-recorded after the `drop` describe gained the regenerate-from-scratch rule.
+  propose_plan_update: { ceiling: 375, before: 340 },
   propose_doc_blueprint: { ceiling: 184, before: 263 },
 };
 
-/** Ceilings for the writer system prompts: 75% of the pre-change measurement,
- *  plus the fixed ceiling the plan contract names for the plan writer. */
+/** Ceilings for the writer system prompts: `before` is the size the ceiling was
+ *  last re-recorded from and `ceiling` is 110% of it rounded up to the next
+ *  multiple of 5. */
 const WRITER_PROMPT_BUDGETS: ReadonlyArray<{ label: string; text: () => string; ceiling: number; before: number }> = [
-  { label: "WRITER_SYSTEM_PROMPT", text: () => WRITER_SYSTEM_PROMPT, ceiling: 620, before: 796 },
-  { label: "PLAN_UPDATE_WRITER_SYSTEM_PROMPT", text: () => PLAN_UPDATE_WRITER_SYSTEM_PROMPT, ceiling: 538, before: 717 },
+  // Re-recorded after the `lines` label gained "(no range given)" and the new-file
+  // and anti-repetition rules.
+  { label: "WRITER_SYSTEM_PROMPT", text: () => WRITER_SYSTEM_PROMPT, ceiling: 765, before: 691 },
+  { label: "PLAN_UPDATE_WRITER_SYSTEM_PROMPT", text: () => PLAN_UPDATE_WRITER_SYSTEM_PROMPT, ceiling: 715, before: 647 },
   { label: "DOC_WRITER_SYSTEM_PROMPT", text: () => DOC_WRITER_SYSTEM_PROMPT, ceiling: 167, before: 223 },
 ];
 
-/** The directive's ceiling: 60% of the pre-change 1030-token directive. The
- *  plan contract names 700, which this keeps a margin under. */
-const DIRECTIVE_CEILING = 618;
+/** The directive's ceiling: the newly measured 627 tokens +10% rounded up to
+ *  the next multiple of 5. The 700-token contract still holds, with margin. */
+const DIRECTIVE_CEILING = 690;
 
 /** Instructions the plan-mode directive must still carry after compression. */
 const DIRECTIVE_KEYWORDS: readonly string[] = [
@@ -66,6 +72,7 @@ const DIRECTIVE_KEYWORDS: readonly string[] = [
   "local://",
   "never compose",
   "write the plan Markdown yourself",
+  "regenerates that section from scratch",
 ];
 
 /** Every tuple position, bound, and operation char each tool schema must spell
@@ -126,64 +133,6 @@ const WRITER_HEADINGS: readonly string[] = [
   "## Assumptions & contingencies",
 ];
 
-/** Every parameter name and every `desc`/`expected` string a registered Zod
- *  schema carries, once each.  The omptype schema exposes its IR (`schema.ir`);
- *  `props[].key` names the parameter the model sees and its `cfg.expected`
- *  mirrors a field's `desc`, so the strings are deduplicated. */
-function schemaText(schema: unknown): string {
-  const found: string[] = [];
-  const seen = new Set<unknown>();
-  const walk = (node: unknown): void => {
-    if (Array.isArray(node)) {
-      node.forEach(walk);
-      return;
-    }
-    if (typeof node !== "object" || node === null) return;
-    if (seen.has(node)) return;
-    seen.add(node);
-    for (const [key, value] of Object.entries(node)) {
-      if (key === "key" && typeof value === "string") found.push(value);
-      else if ((key === "desc" || key === "expected") && typeof value === "string") found.push(value);
-      else walk(value);
-    }
-  };
-  walk((schema as { ir?: unknown }).ir);
-  return [...new Set(found)].join("\n");
-}
-
-interface RegisteredToolText {
-  name: string;
-  description: string;
-  parameters: string;
-}
-
-/** The tool texts the model actually receives, captured from the registered
- *  definitions rather than from the source file, so a schema that never reaches
- *  the model cannot satisfy a budget. */
-function registeredToolTexts(): RegisteredToolText[] {
-  const fake = createFakeExtensionApi();
-  scribe(fake.pi);
-  return fake.tools.map(tool => ({
-    name: tool.name,
-    description: String(tool.definition["description"] ?? ""),
-    parameters: schemaText(tool.definition["parameters"]),
-  }));
-}
-
-/** The `<scribe>` directive the extension injects on a plan turn, captured from
- *  the registered `before_agent_start` handler. */
-async function capturePlanDirective(): Promise<string> {
-  const fake = createFakeExtensionApi();
-  scribe(fake.pi);
-  const { ctx } = createFakeExtensionContext({ branch: [modeChangeEntry("plan")] });
-  const result = (await fake.emit(
-    "before_agent_start",
-    { type: "before_agent_start", systemPrompt: [] },
-    ctx,
-  )) as { systemPrompt?: string[] } | undefined;
-  return (result?.systemPrompt ?? []).join("\n");
-}
-
 describe("plan-mode directive budget", () => {
   tokenIt(`stays within ${DIRECTIVE_CEILING} ${ENCODING} tokens and keeps every instruction keyword`, async () => {
     const directive = await capturePlanDirective();
@@ -198,7 +147,7 @@ describe("tool schema budget", () => {
 
   for (const text of texts) {
     const budget = TOOL_TEXT_BUDGETS[text.name];
-    tokenIt(`${text.name} stays within 70% of its recorded ${budget?.before ?? 0}-token text`, () => {
+    tokenIt(`${text.name} stays within its recorded ${budget?.before ?? 0}-token measurement +10% headroom`, () => {
       expect(budget).toBeDefined();
       const total = tokens(`${text.description}\n${text.parameters}`);
       expect(total).toBeLessThanOrEqual(budget!.ceiling);
@@ -209,7 +158,7 @@ describe("tool schema budget", () => {
 
 describe("writer system prompt budget", () => {
   for (const prompt of WRITER_PROMPT_BUDGETS) {
-    tokenIt(`${prompt.label} stays within 75% of its recorded ${prompt.before}-token prompt`, () => {
+    tokenIt(`${prompt.label} stays within its recorded ${prompt.before}-token measurement +10% headroom`, () => {
       expect(tokens(prompt.text())).toBeLessThanOrEqual(prompt.ceiling);
     });
   }

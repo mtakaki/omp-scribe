@@ -36,6 +36,10 @@ export interface LoadedTokenFixture {
   brief: string;
   /** The concatenated hydrated `source:` blocks inside `brief`. */
   snippetText: string;
+  /** The checked-in expanded plan body for the same blueprint, exactly as a
+   *  writer model returned it: the plan-versus-blueprint example in the README
+   *  and the harness's plan-body stage row both measure this text. */
+  planBody: string;
 }
 
 async function hydratePlan(plan: PlanBlueprint): Promise<LoadedTokenFixture> {
@@ -47,6 +51,7 @@ async function hydratePlan(plan: PlanBlueprint): Promise<LoadedTokenFixture> {
     hydrated,
     brief: buildPlanPromptText(plan, hydrated),
     snippetText: hydrated.map(entry => entry.snippet).join("\n"),
+    planBody: await readFile(join(TOKEN_FIXTURE_ROOT, "plan.md"), "utf8"),
   };
 }
 
@@ -110,7 +115,7 @@ export function renderProseEquivalent(plan: PlanBlueprint): string {
   const lines: string[] = [plan.title, "", expand(plan.context), "", "Approach:"];
 
   plan.steps.forEach(([fileId, operation, range, intent, preserve, doNot], index) => {
-    const where = range === null ? "new file" : `lines ${range[0]}-${range[1]}`;
+    const where = range === null ? "lines: (no range given)" : `lines: ${range[0]}-${range[1]}`;
     const constraints = [
       preserve.length > 0 ? `Preserve: ${preserve.map(expand).join("; ")}.` : "",
       doNot.length > 0 ? `Do not: ${doNot.map(expand).join("; ")}.` : "",

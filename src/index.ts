@@ -37,6 +37,7 @@ import {
   expandPlanUpdateToMarkdown,
   planUpdateDrops,
   planUpdateHeadings,
+  planUpdateRemovals,
 } from "./writer-session";
 import type { FidelityReport, LiteralRunMetrics } from "./literal-fidelity";
 import { computeCosts } from "./pricing";
@@ -55,7 +56,7 @@ Cost control is active for this plan turn: never compose the Markdown plan docum
 1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown). Its parameters are documented on the tool: slug, title, context, verification, assumptions, literals, files, steps. Declare each exact string the plan must preserve character-for-character once in literals — [id, value] pairs, id matching [A-Za-z][A-Za-z0-9_-]{0,15} and unique ignoring case, value the exact text of at most 8000 characters. Where a declared value belongs, write the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once; the extension substitutes the exact value after the writer's response, so the writer never types it. Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
 2. Then call \`write\` with path \`local://<slug>-plan.md\` (the slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown before the write executes. Use \`write\` even when the plan file already exists: the draft replaces it completely, so never edit in place.
 3. The tool result reports literal fidelity — "verified verbatim", or the exact literals the draft lost — as machine-checked evidence: do NOT re-read the plan file and do NOT re-check it against your blueprint. If literals are still listed missing after the repair pass, record the gap with \`${PLAN_UPDATE_TOOL_NAME}\` instead of reading the file back.
-4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete. Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
+4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete (naming a heading in both drop and the field that supplies it regenerates that section from scratch). Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
 5. Then continue the normal \`xd://propose\` submission with that slug.
 Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>`;
@@ -94,7 +95,7 @@ function formatFidelityLine(fidelity: FidelityReport | undefined, metrics: Liter
     const shown = missing.slice(0, MAX_REPORTED_MISSING_LITERALS).map(literal => `\`${literal}\``).join(", ");
     const more = missing.length - MAX_REPORTED_MISSING_LITERALS;
     parts.push(
-      `Literal fidelity: the draft is missing ${missing.length} load-bearing literal${missing.length === 1 ? "" : "s"}: ${shown}${more > 0 ? ` and ${more} more` : ""}. A declared literal the writer omitted is reported rather than repaired, so do not re-read the plan file to verify it; record the gap with ${PLAN_UPDATE_TOOL_NAME} before proposing.`,
+      `Literal fidelity: the repair pass could not restore ${missing.length} load-bearing literal${missing.length === 1 ? "" : "s"}: ${shown}${more > 0 ? ` and ${more} more` : ""}. Do not re-read the plan file to verify them; record the gap with ${PLAN_UPDATE_TOOL_NAME} before proposing.`,
     );
   } else if (fidelity.checked > 0) {
     const verified = fidelity.checked === 1 ? "is" : "are";
@@ -409,7 +410,9 @@ export default function scribe(pi: ExtensionAPI): void {
       drop: z
         .array(z.string())
         .optional()
-        .describe("Plan section headings to delete, e.g. \"Assumptions & contingencies\""),
+        .describe(
+          "Plan section headings to delete, e.g. \"Assumptions & contingencies\". A heading this call also supplies through another field is regenerated from scratch rather than deleted.",
+        ),
     }),
     approval: "read",
     strict: true,
@@ -419,6 +422,9 @@ export default function scribe(pi: ExtensionAPI): void {
       const delta = params as PlanUpdateBlueprint;
       const headings = planUpdateHeadings(delta);
       const drops = planUpdateDrops(delta);
+      /** A heading the delta also supplies is regenerated, not removed, so it
+       *  is spliced by the replacement path and never counted as dropped. */
+      const removals = planUpdateRemovals(delta);
       if (headings.length === 0 && drops.length === 0) {
         return {
           content: [
@@ -470,7 +476,7 @@ export default function scribe(pi: ExtensionAPI): void {
       /** A drop rewrites no prose, so it needs no writer session: splice it out
        *  and hand the result to the normal write swap. */
       if (headings.length === 0) {
-        const spliced = splicePlanSections(currentText, [], drops);
+        const spliced = splicePlanSections(currentText, [], removals);
         store.set(writeSlug, {
           sessionKey: key,
           markdown: spliced,
@@ -489,10 +495,10 @@ export default function scribe(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: `Plan update accepted: removed ${drops.join(", ")} with no writer session (nothing to regenerate); ${spliced.length} chars drafted. Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
+              text: `Plan update accepted: removed ${removals.join(", ")} with no writer session (nothing to regenerate); ${spliced.length} chars drafted. Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
             },
           ],
-          details: { slug: writeSlug, rewritten: headings, dropped: drops, markdownChars: spliced.length },
+          details: { slug: writeSlug, rewritten: headings, dropped: removals, markdownChars: spliced.length },
         };
       }
 
@@ -535,7 +541,7 @@ export default function scribe(pi: ExtensionAPI): void {
         };
       }
 
-      const spliced = splicePlanSections(currentText, replacements, drops);
+      const spliced = splicePlanSections(currentText, replacements, removals);
       store.set(writeSlug, {
         sessionKey: key,
         markdown: spliced,
@@ -570,7 +576,7 @@ export default function scribe(pi: ExtensionAPI): void {
         details: {
           slug: writeSlug,
           rewritten: headings,
-          dropped: drops,
+          dropped: removals,
           markdownChars: spliced.length,
           writerModel: `${result.model.provider}/${result.model.id}`,
           fidelity: result.fidelity,
