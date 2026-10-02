@@ -44,7 +44,8 @@ const TOOL_TEXT_BUDGETS: Readonly<Record<string, { ceiling: number; before: numb
   propose_plan_blueprint: { ceiling: 412, before: 589 },
   // Re-recorded after the `drop` describe gained the regenerate-from-scratch rule.
   propose_plan_update: { ceiling: 375, before: 340 },
-  propose_doc_blueprint: { ceiling: 184, before: 263 },
+  // Re-recorded after the shared `literals` description gained the 1-32 id bound.
+  propose_doc_blueprint: { ceiling: 205, before: 185 },
 };
 
 /** Ceilings for the writer system prompts: `before` is the size the ceiling was
@@ -73,6 +74,7 @@ const DIRECTIVE_KEYWORDS: readonly string[] = [
   "never compose",
   "write the plan Markdown yourself",
   "regenerates that section from scratch",
+  "1-32",
 ];
 
 /** Every tuple position, bound, and operation char each tool schema must spell
@@ -93,7 +95,8 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     '"+" add',
     '"!" delete',
     '"~" modify',
-    "[A-Za-z][A-Za-z0-9_-]{0,15}",
+    "[A-Za-z][A-Za-z0-9_-]*",
+    "1-32",
     "8000",
   ],
   propose_plan_update: [
@@ -107,7 +110,8 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     "drop",
     "3-element [id, path, reason]",
     "6-element [fileId, operation, range|null, intent, preserve[], doNot[]]",
-    "[A-Za-z][A-Za-z0-9_-]{0,15}",
+    "[A-Za-z][A-Za-z0-9_-]*",
+    "1-32",
     "8000",
     "requires files",
   ],
@@ -119,7 +123,8 @@ const TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
     "Section heading (H2)",
     "literals",
     "2-element [id, value]",
-    "[A-Za-z][A-Za-z0-9_-]{0,15}",
+    "[A-Za-z][A-Za-z0-9_-]*",
+    "1-32",
     "8000",
   ],
 };

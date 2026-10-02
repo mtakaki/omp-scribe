@@ -348,7 +348,8 @@ export const MAX_FIDELITY_REPAIR_ROUNDS = 2;
  *  `extractInline` mines that text for literal-shaped strings as well as the
  *  declared `[[id]]` markers it references — false for a refinement's Context
  *  paragraph, whose wording legitimately changes while its markers stay
- *  required. */
+ *  required, and ignored entirely once the caller declares a literal table,
+ *  because the table is then the authoritative literal set. */
 interface FidelitySource {
   heading: string;
   text: string;
@@ -391,13 +392,17 @@ function fidelitySources(input: {
  *  alike need no gate, so both are dropped rather than verified against
  *  nothing.  Each target's literals are the declared values its `[[id]]`
  *  markers reference, followed by the literals its own text supplies when
- *  `extractInline` allows it. */
+ *  `extractInline` allows it — which a declared table switches off entirely, so
+ *  a planner that names its literals never has undeclared brief prose mined
+ *  behind its back. */
 function fidelityTargets(sources: readonly FidelitySource[], literals: readonly ScribeLiteral[] | undefined): RepairTarget[] {
   const targets: RepairTarget[] = [];
+  const declared = literals !== undefined && literals.length > 0;
   for (const source of sources) {
     const supplied = source.text.trim();
     if (supplied === "") continue;
-    const inline = source.extractInline ? extractLiterals(resolveLiteralPlaceholders(source.text, literals).markdown) : [];
+    const mine = source.extractInline && !declared;
+    const inline = mine ? extractLiterals(resolveLiteralPlaceholders(source.text, literals).markdown) : [];
     const merged = mergeLiterals(referencedLiterals(source.text, literals), inline);
     if (merged.length === 0) continue;
     targets.push({ heading: source.heading, literals: merged, supplied });

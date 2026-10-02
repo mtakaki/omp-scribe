@@ -181,9 +181,9 @@ const PATH_RE = /\b[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z][A-Za-z0-9]*
  *  margin while a whole-document dump still trips the bound. */
 export const MAX_LITERAL_VALUE_LENGTH = 8000;
 
-/** The id grammar a literal-table entry may use: a letter, then up to 15
+/** The id grammar a literal-table entry may use: a letter, then up to 31
  *  letters, digits, underscores, or hyphens. */
-export const LITERAL_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,15}$/;
+export const LITERAL_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 
 /** A `[[` … `]]` marker span: a body of 0 to 64 characters other than `[`, `]`,
  *  or a newline.  Global, for scanning and substitution. */
@@ -524,7 +524,9 @@ export function validateLiteralTable(literals: unknown): void {
     }
     const [id, value] = entry as [unknown, unknown];
     if (typeof id !== "string" || !LITERAL_ID_RE.test(id)) {
-      throw new Error(`literals[${index}]: id must match [A-Za-z][A-Za-z0-9_-]{0,15}, got ${JSON.stringify(id)}.`);
+      throw new Error(
+        `literals[${index}]: id must match [A-Za-z][A-Za-z0-9_-]{0,31} (1-32 characters), got ${JSON.stringify(id)}.`,
+      );
     }
     const key = id.toLowerCase();
     if (seen.has(key)) throw new Error(`literals[${index}]: duplicate literal id ${JSON.stringify(id)}.`);

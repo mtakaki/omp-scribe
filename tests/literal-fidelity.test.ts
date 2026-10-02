@@ -364,7 +364,17 @@ describe("validateLiteralTable", () => {
 
   it("rejects an id outside the grammar", () => {
     expect(() => validateLiteralTable([["1L", "value"]])).toThrow(
-      'literals[0]: id must match [A-Za-z][A-Za-z0-9_-]{0,15}, got "1L".',
+      'literals[0]: id must match [A-Za-z][A-Za-z0-9_-]{0,31} (1-32 characters), got "1L".',
+    );
+  });
+
+  it("accepts a 32-character id and rejects a 33-character one", () => {
+    const id32 = `T${"a".repeat(31)}`;
+    expect(id32).toHaveLength(32);
+    expect(() => validateLiteralTable([["TBL_ARTIST_SORTING", "value"]])).not.toThrow();
+    expect(() => validateLiteralTable([[id32, "value"]])).not.toThrow();
+    expect(() => validateLiteralTable([[`${id32}a`, "value"]])).toThrow(
+      `literals[0]: id must match [A-Za-z][A-Za-z0-9_-]{0,31} (1-32 characters), got ${JSON.stringify(`${id32}a`)}.`,
     );
   });
 

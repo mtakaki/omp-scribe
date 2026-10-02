@@ -122,6 +122,15 @@ const CONTEXT_MARKER_BLUEPRINT: PlanBlueprint = {
   context: "The search API now refuses malformed requests with the `[[L3]]` error.",
 };
 
+/** {@link DECLARED_BLUEPRINT} whose Context sentence names a path no table
+ *  entry declares: once a table is declared, that undeclared prose is not
+ *  mined, so a draft may omit it without spending a repair session. */
+const UNDECLARED_CONTEXT_BLUEPRINT: PlanBlueprint = {
+  ...DECLARED_BLUEPRINT,
+  slug: "undeclared-context-plan",
+  context: "The search API changed how it rejects malformed requests via `src/undeclared.ts`.",
+};
+
 /** {@link DECLARED_DRAFT} with the Context paragraph reworded but its declared
  *  marker kept, which must pass the gate without a repair session. */
 const REPHRASED_CONTEXT_DRAFT = DECLARED_DRAFT.replace(
@@ -841,6 +850,24 @@ describe("literal fidelity", () => {
     expect(result.fidelity?.missing).toEqual([]);
     expect(result.fidelity?.repaired).toBe(false);
     expect(result.literalMetrics.resolved).toBe(4);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("does not gate an undeclared inline literal once a table is declared", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", UNDECLARED_CONTEXT_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The declared table is the authoritative literal set, so the Context path
+    // no entry declares is never mined and its absence is not a gap.
+    expect(result.markdown).not.toContain("src/undeclared.ts");
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
     expect(sessionCount()).toBe(1);
   });
 });
