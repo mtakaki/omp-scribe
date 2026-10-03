@@ -2403,4 +2403,90 @@ Context sentence referencing [[L1]].
     expect(details.fidelity?.missing).toEqual([]);
     expect(pendingMarkdownStore().get("literal-long")?.markdown).toContain(longValue);
   });
+
+  it("rejects a blueprint whose prose names a marker no literal declares", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(MARKER_DRAFT));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-literal-undeclared",
+      {
+        slug: "literal-undeclared",
+        title: "Fixture Plan",
+        context: "Context sentence.",
+        files: [["E", "src/example.ts", "example file mentioning [[policyName]]"]],
+        steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[emailsKey]]`.", [], []]],
+        verification: [],
+        assumptions: [],
+      },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("no literal declares");
+    expect(text).toContain("[[emailsKey]]");
+    expect(text).toContain("[[policyName]]");
+    // Rejected before any file is read, so no writer session and no draft.
+    expect(pendingMarkdownStore().get("literal-undeclared")).toBeUndefined();
+  });
+
+  it("names a marker the draft invented while keeping it in the pending draft", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(successScript(MARKER_DRAFT.replace("to use `[[L1]]`", "to use `[[L1]]` past `[[L9]]`")));
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-literal-invented",
+      makeLiteralBlueprint("literal-invented"),
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBeUndefined();
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    // The declared markers all resolved, so the verdict is still fidelity.
+    expect(text).toContain("verified verbatim");
+    expect(text).toContain("substituted 2 declared literals from the literal table deterministically");
+    expect(text).toContain("could not resolve 1 marker");
+    expect(text).toContain("[[L9]]");
+    const details = result["details"] as { literalMetrics?: { resolved: number; unresolved: string[] } };
+    expect(details.literalMetrics?.resolved).toBe(2);
+    expect(details.literalMetrics?.unresolved).toEqual(["L9"]);
+    // Reporting only: the marker the planner still has to declare is what the
+    // write swap would finalize.
+    expect(pendingMarkdownStore().get("literal-invented")?.markdown).toContain("[[L9]]");
+  });
+
+  it("rejects a doc bullet naming a marker no literal declares", async () => {
+    const fakeApi = createFakeExtensionApi();
+    scribe(fakeApi.pi);
+    const { ctx } = createFakeExtensionContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      DOC_BLUEPRINT_TOOL_NAME,
+      "tcid-doc-undeclared",
+      {
+        slug: "doc-undeclared",
+        title: "Doc",
+        path: "DOC.md",
+        sections: [{ heading: "Overview", bullets: ["Run the check with [[emailsKey]]."] }],
+      },
+      ctx,
+    )) as Record<string, unknown>;
+
+    expect(result["isError"]).toBe(true);
+    expect((result["content"] as Array<{ text: string }>)[0]!.text).toContain("no literal declares");
+    expect(pendingDocMarkdownStore().has("DOC.md")).toBe(false);
+  });
 });

@@ -5,19 +5,19 @@ import { hydrateScribeStep, resolveScribeSteps, validateScribeBlueprint, type Hy
 import { PLAN_SECTIONS, planHeadingKey, splicePlanSections, splitPlanSections, type PlanDocument, type PlanSection } from "./plan-sections";
 import {
   PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT,
+  absentGaps,
   buildRepairPromptText,
   checkFidelity,
   extractLiterals,
   formatLiteralTable,
+  gapLiterals,
   literalDumpLines,
   mergeLiterals,
-  normalizeForMatch,
   referencedLiterals,
   removeLiteralDumpLines,
   resolveLiteralPlaceholders,
   validateLiteralTable,
   validateLiteralUsage,
-  type FidelityGap,
   type FidelityReport,
   type LiteralRunMetrics,
   type RepairTarget,
@@ -524,22 +524,15 @@ async function enforceLiteralFidelity(
    *  the same text, so a dump line cannot be copied forward. */
   const gateSections = (text: string): PlanSection[] => splitPlanSections(removeLiteralDumpLines(text)).sections;
   let report = checkFidelity(targets, gateSections(markdown));
-  const initiallyMissing = report.missing.length;
-  /** The gaps a repair session could still close: a literal absent from the
-   *  whole gate haystack.  A literal that already survives elsewhere in the
-   *  plan is not lost, so re-emitting it in one flagged section would buy
-   *  nothing.  Declared values are repairable too — the repair brief prints
-   *  their `[[<id>]]` marker, and the extension substitutes the exact value. */
-  const repairableGaps = (current: FidelityReport, sections: readonly PlanSection[]): FidelityGap[] => {
-    const haystack = normalizeForMatch(sections.map(section => section.text).join("\n"));
-    return current.gaps
-      .map(gap => ({
-        heading: gap.heading,
-        missing: gap.missing.filter(literal => !haystack.includes(normalizeForMatch(literal))),
-      }))
-      .filter(gap => gap.missing.length > 0);
+  /** The verdict narrowed to what the whole draft is missing: a literal that
+   *  survives in another section is not lost, so re-emitting it in a flagged
+   *  section would buy nothing and calling it missing would be untrue. */
+  const lostReport = (current: FidelityReport): FidelityReport => {
+    const gaps = absentGaps(current, gateSections(markdown));
+    return { ...current, gaps, missing: gapLiterals(gaps) };
   };
-  let repairable = repairableGaps(report, gateSections(markdown));
+  let repairable = lostReport(report).gaps;
+  const initiallyMissing = gapLiterals(repairable).length;
   let rounds = 0;
 
   while (repairable.length > 0 && rounds < MAX_FIDELITY_REPAIR_ROUNDS) {
@@ -572,10 +565,13 @@ async function enforceLiteralFidelity(
     if (next === markdown) break;
     markdown = next;
     report = checkFidelity(targets, gateSections(markdown));
-    repairable = repairableGaps(report, gateSections(markdown));
+    repairable = lostReport(report).gaps;
   }
 
   metrics.repairRounds = rounds;
+
+  // The caller sees the same narrowing the repair loop acted on.
+  report = lostReport(report);
 
   if (ctx.hasUI) {
     if (report.missing.length > 0) {

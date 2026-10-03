@@ -149,6 +149,10 @@ const OMITTED_DRAFT = DECLARED_DRAFT.replace(" and reject with `[[L2]]`", "");
 /** {@link DECLARED_DRAFT} emitting one declared marker twice. */
 const DUPLICATE_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` from `[[L1]]`");
 
+/** {@link DECLARED_DRAFT} plus a marker no table entry declares: the gate
+ *  reports it as unresolved rather than stripping it from the plan. */
+const INVENTED_MARKER_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` past `[[L9]]`");
+
 /** The repair response for a draft that dropped `[[L2]]`: it re-emits the
  *  declared marker, which the extension substitutes with the exact value. */
 const DECLARED_REPAIR = `## Approach
@@ -760,6 +764,45 @@ describe("literal fidelity", () => {
     expect(result.literalMetrics.unresolved).toEqual([]);
     expect(result.fidelity?.missing).toEqual([]);
     expect(result.fidelity?.repaired).toBe(false);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("does not report a declared literal the draft carries in another section", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", CONTEXT_MARKER_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The Context paragraph of DECLARED_DRAFT dropped its marker, but the
+    // Approach section states the same value: the literal was relocated, not
+    // lost, so neither a repair session nor a missing literal is warranted.
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.markdown).toContain("Invalid search plan");
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("reports a marker no declared literal owns without stripping it", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(INVENTED_MARKER_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.literalMetrics.unresolved).toEqual(["L9"]);
+    expect(result.literalMetrics.resolved).toBe(3);
+    // The gate reports the marker; it never rewrites the draft.
+    expect(result.markdown).toContain("[[L9]]");
+    // Every declared literal survives, so the gate spent no repair round.
+    expect(result.fidelity?.missing).toEqual([]);
     expect(sessionCount()).toBe(1);
   });
 

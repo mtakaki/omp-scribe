@@ -9,11 +9,13 @@ import { PLAN_SECTIONS, type PlanSection } from "../src/plan-sections";
 import type { ScribeLiteral } from "../src/types";
 import {
   PLAN_FIDELITY_REPAIR_SYSTEM_PROMPT,
+  absentGaps,
   buildRepairPromptText,
   checkFidelity,
   extractLiterals,
   findMissingLiterals,
   formatLiteralTable,
+  gapLiterals,
   literalDumpLines,
   literalMarkers,
   mergeLiterals,
@@ -155,6 +157,41 @@ describe("checkFidelity", () => {
     expect(report.gaps).toHaveLength(2);
     expect(report.missing).toEqual(["derive_variant_key"]);
     expect(report.checked).toBe(1);
+  });
+});
+
+describe("absentGaps / gapLiterals", () => {
+  const RELOCATED: FidelityTarget[] = [
+    { heading: "Context", literals: ["refresh_token"] },
+    { heading: "Approach", literals: ["src/auth.ts"] },
+  ];
+
+  it("drops a gap whose literal the draft carries in another section", () => {
+    // Context lost it, Approach states it — the literal was relocated, not lost.
+    const report = checkFidelity(RELOCATED, SECTIONS);
+
+    expect(report.missing).toEqual(["refresh_token"]);
+    expect(absentGaps(report, SECTIONS)).toEqual([]);
+    expect(gapLiterals(absentGaps(report, SECTIONS))).toEqual([]);
+  });
+
+  it("keeps a gap carrying only the literals no section states", () => {
+    const report = checkFidelity([{ heading: "Context", literals: ["refresh_token", "tenant_scoped_writes"] }], SECTIONS);
+
+    expect(report.missing).toEqual(["refresh_token", "tenant_scoped_writes"]);
+    expect(absentGaps(report, SECTIONS)).toEqual([{ heading: "Context", missing: ["tenant_scoped_writes"] }]);
+    // The narrowing touches gaps and missing only.
+    expect(report.checked).toBe(2);
+    expect(report.missingSections).toEqual([]);
+  });
+
+  it("collapses two gaps naming the same literal into one entry", () => {
+    const gaps: FidelityGap[] = [
+      { heading: "Context", missing: ["tenant_scoped_writes"] },
+      { heading: "Approach", missing: ["tenant_scoped_writes", "src/missing.ts"] },
+    ];
+
+    expect(gapLiterals(gaps)).toEqual(["tenant_scoped_writes", "src/missing.ts"]);
   });
 });
 
@@ -426,6 +463,34 @@ describe("validateLiteralUsage", () => {
   it("throws naming every id no marker references", () => {
     expect(() => validateLiteralUsage([["L1", "x"], ["L2", "y"]], ["plain prose with no marker"])).toThrow(
       'literals: "L1", "L2" declared but never referenced as [[<id>]] in the blueprint\'s prose; reference each one where its value belongs, or drop it.',
+    );
+  });
+
+  it("rejects a marker no declared literal owns, table or none", () => {
+    const expected =
+      "literals: the blueprint's prose uses [[emailsKey]], [[policyName]] but no literal declares them; declare each id with the exact value it stands for, or drop the marker.";
+
+    // The reported failure: markers written, no table declared at all.
+    expect(() => validateLiteralUsage([], ["Context names [[emailsKey]] and [[policyName]]."])).toThrow(expected);
+    // An omitted table reaches the validator the same way.
+    expect(() => validateLiteralUsage(undefined, ["Context names [[emailsKey]] and [[policyName]]."])).toThrow(expected);
+  });
+
+  it("reads the singular form for one undeclared marker", () => {
+    expect(() => validateLiteralUsage([], ["files: [[emailsKey]]"])).toThrow(
+      "literals: the blueprint's prose uses [[emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
+    );
+  });
+
+  it("names only the undeclared remainder of a partly declared set", () => {
+    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[L1]] and [[L9]]"])).toThrow(
+      "literals: the blueprint's prose uses [[L9]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
+    );
+  });
+
+  it("names a repeated or differently cased marker once", () => {
+    expect(() => validateLiteralUsage([], ["[[emailsKey]] then [[emailsKey]] then [[EMAILSKEY]]"])).toThrow(
+      "literals: the blueprint's prose uses [[emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
     );
   });
 });

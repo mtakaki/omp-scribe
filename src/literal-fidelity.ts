@@ -443,18 +443,42 @@ export function checkFidelity(
     if (missing.length > 0) gaps.push({ heading: target.heading, missing });
   }
 
-  const missing: string[] = [];
+  return { checked: checked.size, repaired: false, missing: gapLiterals(gaps), missingSections, gaps };
+}
+
+/**
+ * The literals of `gaps`, in reading order, de-duplicated under
+ * {@link normalizeForMatch} so two gaps naming the same literal report it once.
+ */
+export function gapLiterals(gaps: readonly FidelityGap[]): string[] {
+  const literals: string[] = [];
   const seen = new Set<string>();
   for (const gap of gaps) {
     for (const literal of gap.missing) {
       const key = normalizeForMatch(literal);
       if (seen.has(key)) continue;
       seen.add(key);
-      missing.push(literal);
+      literals.push(literal);
     }
   }
+  return literals;
+}
 
-  return { checked: checked.size, repaired: false, missing, missingSections, gaps };
+/**
+ * `report` narrowed to the gaps whose literals `sections` does not carry
+ * anywhere: a literal that survives in another section — or in the same one
+ * under a different wrapping — was never lost, so reporting it as missing would
+ * be untrue and re-emitting it in a flagged section would buy nothing.
+ * `checked` and `missingSections` pass through unchanged.
+ */
+export function absentGaps(report: FidelityReport, sections: readonly PlanSection[]): FidelityGap[] {
+  const haystack = normalizeForMatch(sections.map(section => section.text).join("\n"));
+  return report.gaps
+    .map(gap => ({
+      heading: gap.heading,
+      missing: gap.missing.filter(literal => !haystack.includes(normalizeForMatch(literal))),
+    }))
+    .filter(gap => gap.missing.length > 0);
 }
 
 /**
@@ -552,23 +576,44 @@ export function validateLiteralTable(literals: unknown): void {
 }
 
 /**
- * Reject a declared literal no `[[id]]` marker in `texts` references: an
- * unreferenced entry can never be substituted, so the planner must reference it
- * where its value belongs or drop it.  A no-op for an absent or empty table;
- * ids compare under case folding, matching {@link resolveLiteralPlaceholders}.
+ * Validate the planner's use of `[[id]]` markers against the declared table, in
+ * both directions: every marker in `texts` must name a declared id — a marker
+ * no entry owns can never be substituted, so it would ship into the plan as
+ * literal `[[id]]` text — and every declared id must be named by a marker.
+ * Ids compare under case folding, matching {@link resolveLiteralPlaceholders},
+ * and the marker scan runs even when no table was declared.  A no-op only when
+ * there is no marker and no id to check.
  */
 export function validateLiteralUsage(literals: unknown, texts: readonly string[]): void {
-  if (!Array.isArray(literals) || literals.length === 0) return;
-
-  const referenced = new Set<string>();
-  for (const text of texts) {
-    for (const id of literalMarkers(text)) referenced.add(id.toLowerCase());
+  const table = Array.isArray(literals) ? literals : [];
+  const declared = new Set<string>();
+  for (const entry of table) {
+    if (Array.isArray(entry) && typeof entry[0] === "string") declared.add(entry[0].toLowerCase());
   }
 
-  const unreferenced = literals
+  const markers: string[] = [];
+  const seenMarkers = new Set<string>();
+  for (const text of texts) {
+    for (const id of literalMarkers(text)) {
+      const key = id.toLowerCase();
+      if (seenMarkers.has(key)) continue;
+      seenMarkers.add(key);
+      markers.push(id);
+    }
+  }
+
+  const undeclared = markers.filter(id => !declared.has(id.toLowerCase()));
+  if (undeclared.length > 0) {
+    const names = undeclared.map(id => `[[${id}]]`).join(", ");
+    throw new Error(
+      `literals: the blueprint's prose uses ${names} but no literal declares ${undeclared.length === 1 ? "it" : "them"}; declare each id with the exact value it stands for, or drop the marker.`,
+    );
+  }
+
+  const unreferenced = table
     .filter((entry: unknown): entry is [string, unknown] => Array.isArray(entry) && typeof entry[0] === "string")
     .map(([id]) => id)
-    .filter(id => !referenced.has(id.toLowerCase()));
+    .filter(id => !seenMarkers.has(id.toLowerCase()));
 
   if (unreferenced.length > 0) {
     throw new Error(

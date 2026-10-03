@@ -74,21 +74,23 @@ const MAX_REPORTED_MISSING_LITERALS = 8;
 
 /**
  * The literal-fidelity sentence appended to a tool result: what the gate
- * verified, how many declared literals it substituted deterministically, or
- * which literals the draft lost and how to record the gap.
+ * verified, how many declared literals it substituted deterministically, which
+ * markers the draft carries that no declared literal owns, or which literals
+ * the draft lost and how to record the gap.
  *
  * Returns "" when the path produced no report (the tool did not run the gate)
  * or when there is nothing at all to report — no literal to check, none
- * missing, no section omitted — so callers can append the result
- * unconditionally.  Each missing literal is named once, and the sentence tells
- * the brain not to re-read the plan file — that re-read plus the
+ * missing, no section omitted, no unresolved marker — so callers can append the
+ * result unconditionally.  Each missing literal is named once, and the sentence
+ * tells the brain not to re-read the plan file — that re-read plus the
  * `propose_plan_update` it triggers is the cost the gate exists to remove.
  */
 function formatFidelityLine(fidelity: FidelityReport | undefined, metrics: LiteralRunMetrics | undefined): string {
   if (fidelity === undefined) return "";
 
   const missing = [...new Set(fidelity.missing)];
-  if (fidelity.checked === 0 && missing.length === 0 && fidelity.missingSections.length === 0) return "";
+  const unresolved = metrics === undefined ? [] : [...new Set(metrics.unresolved)];
+  if (fidelity.checked === 0 && missing.length === 0 && fidelity.missingSections.length === 0 && unresolved.length === 0) return "";
 
   const parts: string[] = [];
   if (missing.length > 0) {
@@ -109,6 +111,13 @@ function formatFidelityLine(fidelity: FidelityReport | undefined, metrics: Liter
   if (metrics !== undefined && metrics.resolved > 0) {
     parts.push(
       `Scribe substituted ${metrics.resolved} declared literal${metrics.resolved === 1 ? "" : "s"} from the literal table deterministically.`,
+    );
+  }
+  if (unresolved.length > 0) {
+    const shown = unresolved.slice(0, MAX_REPORTED_MISSING_LITERALS).map(id => `[[${id}]]`).join(", ");
+    const more = unresolved.length - MAX_REPORTED_MISSING_LITERALS;
+    parts.push(
+      `Scribe could not resolve ${unresolved.length} marker${unresolved.length === 1 ? "" : "s"} the draft carries: ${shown}${more > 0 ? ` and ${more} more` : ""}; declare each id in the literals table with the exact value it stands for, or re-record the section that carries it with ${PLAN_UPDATE_TOOL_NAME}.`,
     );
   }
   return parts.join(" ");
@@ -135,9 +144,11 @@ const PLAN_MODE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDAT
 /** Appended to both plan tools' `steps` description.  The literal-fidelity gate
  *  can only verify literals a step names, and the writer can only reproduce
  *  what it is handed verbatim, so a literal left implicit in the intent's prose
- *  may legitimately be paraphrased away. */
+ *  may legitimately be paraphrased away.  A marker no declared literal owns can
+ *  never be substituted, so it would ship as literal `[[id]]` text — hence the
+ *  declaration rule. */
 const STEP_LITERAL_REQUIREMENT =
-  "Name every load-bearing literal this step relies on by its [[<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim.";
+  "Declare every load-bearing literal this step relies on in literals and write its [[<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim, and a marker no declared literal owns is rejected.";
 
 /** `literals` parameter description shared by all three blueprint tools, so the
  *  declaration grammar can never drift between them. */
