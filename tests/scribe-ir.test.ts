@@ -7,7 +7,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { hydrateScribeStep, resolveScribeSteps, validateScribeBlueprint, type ScribeStepResolved } from "../src/scribe-ir";
+import { MAX_UNRANGED_SNIPPET_LINES, hydrateScribeStep, resolveScribeSteps, validateScribeBlueprint, type ScribeStepResolved } from "../src/scribe-ir";
 import type { PlanBlueprint } from "../src/types";
 
 /** Runs `run` against a throwaway project root seeded with `files`. */
@@ -136,6 +136,37 @@ describe("hydrateScribeStep", () => {
       expect(hydrated.snippet).toContain("  200| body-200");
       expect(hydrated.snippet).toContain("(50 further lines omitted)");
       expect(hydrated.snippet).not.toContain("body-201");
+    });
+  });
+
+  it("caps an unranged add-step preview at 40 lines and reports the omitted remainder", async () => {
+    const text = Array.from({ length: 300 }, (_unused, index) => `body-${index + 1}`).join("\n");
+    await withProject({ "big.txt": `${text}\n` }, async root => {
+      const hydrated = await hydrateScribeStep(root, step({ filePath: "big.txt", operation: "+" }));
+      expect(hydrated.snippet).toContain("    1| body-1");
+      expect(hydrated.snippet).toContain(`${String(MAX_UNRANGED_SNIPPET_LINES).padStart(5)}| body-${MAX_UNRANGED_SNIPPET_LINES}`);
+      expect(hydrated.snippet).toContain(`(${300 - MAX_UNRANGED_SNIPPET_LINES} further lines omitted)`);
+      expect(hydrated.snippet).not.toContain(`body-${MAX_UNRANGED_SNIPPET_LINES + 1}`);
+    });
+  });
+
+  it("keeps the 200-line cap for an unranged modify step", async () => {
+    const text = Array.from({ length: 300 }, (_unused, index) => `body-${index + 1}`).join("\n");
+    await withProject({ "big.txt": `${text}\n` }, async root => {
+      const hydrated = await hydrateScribeStep(root, step({ filePath: "big.txt", operation: "~" }));
+      expect(hydrated.snippet).toContain("  200| body-200");
+      expect(hydrated.snippet).toContain("(100 further lines omitted)");
+    });
+  });
+
+  it("returns the whole requested range for a ranged add step on a large file", async () => {
+    const text = Array.from({ length: 300 }, (_unused, index) => `body-${index + 1}`).join("\n");
+    await withProject({ "big.txt": `${text}\n` }, async root => {
+      const hydrated = await hydrateScribeStep(root, step({ filePath: "big.txt", operation: "+", lineRange: { start: 100, end: 160 } }));
+      expect(hydrated.snippet).toContain("  100| body-100");
+      expect(hydrated.snippet).toContain("  160| body-160");
+      expect(hydrated.snippet).not.toContain("body-161");
+      expect(hydrated.snippet).not.toContain("further lines omitted");
     });
   });
 });

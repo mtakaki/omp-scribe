@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DocBlueprint, PlanBlueprint } from "../src/types";
-import { DOC_WRITER_SYSTEM_PROMPT, expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "../src/writer-session";
+import {
+  DOC_WRITER_SYSTEM_PROMPT,
+  expandBlueprintToMarkdown,
+  expandDocBlueprintToMarkdown,
+  expandPlanUpdateToMarkdown,
+} from "../src/writer-session";
+import { splitPlanSections } from "../src/plan-sections";
 import { createFakeExtensionContext, createFakeExtensionApi, injectSdk } from "./support/fake-extension-api";
 import { createFakeSdk, type FakeAgentSession, type FakeSdk, type FakeSessionEvent } from "./support/fake-agent-session";
 
@@ -16,6 +22,143 @@ const BLUEPRINT: PlanBlueprint = {
   verification: ["bun test passes"],
   assumptions: [],
 };
+
+/** A blueprint whose step intent names two literals — a path and a backticked
+ *  identifier — so the drafts below can drop one and give the gate something to
+ *  repair. */
+const LOSSY_BLUEPRINT: PlanBlueprint = {
+  slug: "lossy-plan",
+  title: "Lossy Plan",
+  context: "A lossy context sentence.",
+  files: [["L", "src/lossy.ts", "lossy file"]],
+  steps: [["L", "~", [1, 2], "Rename the helper to `deriveVariantKey` in src/lossy.ts.", [], []]],
+  verification: [],
+  assumptions: [],
+};
+
+/** The draft a paraphrasing writer returns for {@link LOSSY_BLUEPRINT}: it
+ *  keeps the path and loses the identifier.  `## Context` follows `## Approach`
+ *  so each section's raw slice ends with the blank line a splice reproduces
+ *  byte-for-byte — which is what makes "the untouched section is untouched"
+ *  testable. */
+const LOSSY_DRAFT = `# Lossy Plan
+
+## Context
+
+A lossy context sentence.
+
+## Approach
+
+- Update src/lossy.ts to rename the helper.
+
+## Verification
+
+- \`bun test\` passes.
+`;
+
+/** The repair response that restores the dropped identifier. */
+const REPAIRED_APPROACH = `## Approach
+
+- Rename the helper to \`deriveVariantKey\` in src/lossy.ts.
+`;
+
+/** {@link LOSSY_DRAFT} with the dropped identifier appended as a literal-only
+ *  line — the shape that satisfies a literal check without stating anything,
+ *  which the gate must strip from a draft and refuse from a repair. */
+const DUMPED_DRAFT = LOSSY_DRAFT.replace(
+  "- Update src/lossy.ts to rename the helper.\n",
+  "- Update src/lossy.ts to rename the helper.\n- `deriveVariantKey`\n",
+);
+
+/** The `## Verification` section a compliant update writer returns for the delta
+ *  used in the update-path case below: the delta's bullet, plus the one already
+ *  on the plan. */
+const REPAIRED_VERIFICATION = `## Verification
+
+- \`bun test tests/auth.test.ts\` passes
+- \`bun test tests/auth-refresh.test.ts\` passes
+`;
+
+/** A blueprint that declares three literals and references each once by its
+ *  `[[id]]` marker, so a marker-emitting draft resolves all three
+ *  deterministically and needs no repair session. */
+const DECLARED_BLUEPRINT: PlanBlueprint = {
+  slug: "declared-plan",
+  title: "Declared Plan",
+  context: "The search API changed how it rejects malformed requests.",
+  files: [["D", "src/search.ts", "the search route"]],
+  steps: [["D", "~", [1, 2], "Return `[[L1]]` and reject with `[[L2]]` when `[[L3]]` is absent.", [], []]],
+  verification: [],
+  assumptions: [],
+  literals: [
+    ["L1", "/api/search-text"],
+    ["L2", "relation_not_allowed_for_entity"],
+    ["L3", "Invalid search plan"],
+  ],
+};
+
+/** The draft a marker-emitting writer returns for {@link DECLARED_BLUEPRINT}:
+ *  each of the three markers exactly once. */
+const DECLARED_DRAFT = `# Declared Plan
+
+## Context
+
+The search API changed how it rejects malformed requests.
+
+## Approach
+
+- Modify \`src/search.ts\` lines 1-2 to return \`[[L1]]\` and reject with \`[[L2]]\` when \`[[L3]]\` is absent.
+
+## Critical files & anchors
+
+- \`src/search.ts\` — the search route
+`;
+
+/** A blueprint variant whose Context section carries a declared marker, so a
+ *  draft may reword that paragraph as long as it keeps the marker. */
+const CONTEXT_MARKER_BLUEPRINT: PlanBlueprint = {
+  ...DECLARED_BLUEPRINT,
+  slug: "context-marker-plan",
+  context: "The search API now refuses malformed requests with the `[[L3]]` error.",
+};
+
+/** {@link DECLARED_BLUEPRINT} whose Context sentence names a path no table
+ *  entry declares: once a table is declared, that undeclared prose is not
+ *  mined, so a draft may omit it without spending a repair session. */
+const UNDECLARED_CONTEXT_BLUEPRINT: PlanBlueprint = {
+  ...DECLARED_BLUEPRINT,
+  slug: "undeclared-context-plan",
+  context: "The search API changed how it rejects malformed requests via `src/undeclared.ts`.",
+};
+
+/** {@link DECLARED_DRAFT} with the Context paragraph reworded but its declared
+ *  marker kept, which must pass the gate without a repair session. */
+const REPHRASED_CONTEXT_DRAFT = DECLARED_DRAFT.replace(
+  "The search API changed how it rejects malformed requests.",
+  "Malformed search requests are now refused with the `[[L3]]` error.",
+);
+
+/** {@link DECLARED_DRAFT} with one declared marker replaced by a paraphrase of
+ *  its value: the extension knows the exact value, so it reports the gap
+ *  instead of spending a repair session. */
+const PARAPHRASED_DRAFT = DECLARED_DRAFT.replace("reject with `[[L2]]`", "reject with `relation-not-permitted`");
+
+/** {@link DECLARED_DRAFT} with one declared marker omitted outright. */
+const OMITTED_DRAFT = DECLARED_DRAFT.replace(" and reject with `[[L2]]`", "");
+
+/** {@link DECLARED_DRAFT} emitting one declared marker twice. */
+const DUPLICATE_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` from `[[L1]]`");
+
+/** {@link DECLARED_DRAFT} plus a marker no table entry declares: the gate
+ *  reports it as unresolved rather than stripping it from the plan. */
+const INVENTED_MARKER_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` past `[[L9]]`");
+
+/** The repair response for a draft that dropped `[[L2]]`: it re-emits the
+ *  declared marker, which the extension substitutes with the exact value. */
+const DECLARED_REPAIR = `## Approach
+
+- Modify \`src/search.ts\` lines 1-2 to return \`[[L1]]\` and reject with \`[[L2]]\` when \`[[L3]]\` is absent.
+`;
 
 function successScript(text: string): FakeSessionEvent[] {
   return [
@@ -288,6 +431,101 @@ describe("expandBlueprintToMarkdown", () => {
     }
   });
 
+  it("prints each file's operation in the FILES block, from the steps that reference it", async () => {
+    const { fakeSdk, setScript, lastSession } = createFakeSdk();
+    setScript(successScript("# Operation Plan\n\nOK."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const blueprint: PlanBlueprint = {
+      slug: "operation-plan",
+      title: "Operation Plan",
+      context: "Touch two files and name a third.",
+      files: [
+        ["E", "src/example.ts", "modified file"],
+        ["N", "src/new.ts", "brand-new module"],
+        ["P", "src/plain.ts", "referenced by no step"],
+      ],
+      steps: [
+        ["E", "~", [1, 2], "Update the example export.", [], []],
+        ["N", "+", null, "Author the new module.", [], []],
+      ],
+      verification: [],
+      assumptions: [],
+    };
+
+    await expandBlueprintToMarkdown(pi, ctx, "@smol", blueprint);
+    const prompt = lastSession()!.lastPrompt ?? "";
+
+    expect(prompt).toContain("- src/example.ts — modify — modified file");
+    // The operation label states the operation alone: whether the file is new
+    // is the step's `lines` label, which hydration decides.
+    expect(prompt).toContain("- src/new.ts — add — brand-new module");
+    // A file no step references has no operation to state.
+    expect(prompt).toContain("- src/plain.ts — referenced by no step");
+    // The file is absent from the default cwd, so the step itself is a new file.
+    expect(prompt).toContain("lines: (new file)");
+  });
+
+  it("labels an unranged step on an existing file as having no range given", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scribe-label-existing-"));
+    try {
+      await mkdir(join(dir, "src"), { recursive: true });
+      await writeFile(join(dir, "src", "existing.ts"), "export const a = 1;\n", "utf8");
+
+      const { fakeSdk, setScript, lastSession } = createFakeSdk();
+      setScript(successScript("# Range Plan\n\nOK."));
+
+      const pi = makeApiWithSdk(fakeSdk);
+      const { ctx } = createFakeExtensionContext({ hasUI: false, cwd: dir });
+
+      await expandBlueprintToMarkdown(pi, ctx, "@smol", {
+        slug: "range-plan",
+        title: "Range Plan",
+        context: "Touch an existing file with no range.",
+        files: [["E", "src/existing.ts", "existing module"]],
+        steps: [["E", "~", null, "Adjust the existing export.", [], []]],
+        verification: [],
+        assumptions: [],
+      });
+
+      const prompt = lastSession()!.lastPrompt ?? "";
+      expect(prompt).toContain("lines: (no range given)");
+      expect(prompt).not.toContain("lines: (new file)");
+      expect(prompt).toContain("- src/existing.ts — modify — existing module");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("labels an unranged add step on a file hydration could not read as a new file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scribe-label-absent-"));
+    try {
+      const { fakeSdk, setScript, lastSession } = createFakeSdk();
+      setScript(successScript("# New File Plan\n\nOK."));
+
+      const pi = makeApiWithSdk(fakeSdk);
+      const { ctx } = createFakeExtensionContext({ hasUI: false, cwd: dir });
+
+      await expandBlueprintToMarkdown(pi, ctx, "@smol", {
+        slug: "new-file-plan",
+        title: "New File Plan",
+        context: "Author a module that does not exist yet.",
+        files: [["N", "src/brand-new.ts", "new module"]],
+        steps: [["N", "+", null, "Author the module from scratch.", [], []]],
+        verification: [],
+        assumptions: [],
+      });
+
+      const prompt = lastSession()!.lastPrompt ?? "";
+      expect(prompt).toContain("lines: (new file)");
+      expect(prompt).not.toContain("lines: (no range given)");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not resolve if agent_end has isTerminal:false", async () => {
     const { fakeSdk, setScript } = createFakeSdk();
     // isTerminal:false should be ignored; only the terminal agent_end resolves the promise.
@@ -309,6 +547,371 @@ describe("expandBlueprintToMarkdown", () => {
     if (!("markdown" in result)) throw new Error("Expected markdown");
     // Both deltas should be accumulated (fake runs all events synchronously in prompt())
     expect(result.markdown).toBe("Part1 Part2");
+  });
+});
+
+// ─── Literal fidelity ─────────────────────────────────────────────────────────
+
+describe("literal fidelity", () => {
+  it("repairs a lossy draft, splices only the flagged section, and accumulates usage", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    // The shared script is the compliant one, so a third session (which would
+    // mean the gate ran a round it should not have) cannot hang the test.
+    setScript(successScript(REPAIRED_APPROACH));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(REPAIRED_APPROACH));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    expect("markdown" in result).toBe(true);
+    if (!("markdown" in result)) throw new Error("unreachable");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.checked).toBe(2);
+    expect(result.markdown).toContain("`deriveVariantKey`");
+    // The gate only splices what it flagged: every other section keeps its bytes.
+    const [draftContext, repairedContext] = [LOSSY_DRAFT, result.markdown].map(
+      text => splitPlanSections(text).sections.find(section => section.heading === "Context")?.text,
+    );
+    expect(repairedContext).toBe(draftContext);
+    // The repair session's tokens and dollars are added, never reset.
+    expect(result.usage.input).toBe(200);
+    expect(result.usage.output).toBe(100);
+    expect(result.costUsd).toBeCloseTo(0.018, 8);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("keeps the writer's literal-only line but does not count it as carrying the literal", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    // The dump is what every session returns, so the repair cannot close the gap.
+    setScript(successScript(DUMPED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The gate no longer deletes a line the writer emitted, so the chip stays in
+    // the plan; it still counts as a lost literal because the check reads the
+    // dump-stripped haystack.
+    expect(result.markdown).toContain("- `deriveVariantKey`");
+    expect(result.markdown).toContain("- Update src/lossy.ts to rename the helper.");
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("refuses a repair that answers with a literal-only line", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DUMPED_DRAFT));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(DUMPED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The dump is never spliced: the plan keeps the draft's own prose, and the
+    // round that changed nothing ends the loop.
+    expect(result.markdown).toBe(LOSSY_DRAFT.trimEnd());
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("reports the repair outcome once, after the last round", async () => {
+    const { fakeSdk, queueScripts, setScript } = createFakeSdk();
+    setScript(successScript(REPAIRED_APPROACH));
+    queueScripts(successScript(LOSSY_DRAFT), successScript(REPAIRED_APPROACH));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx, notifications } = createFakeExtensionContext({ hasUI: true });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual([]);
+    const restored = notifications.filter(n => n.message.includes("restored them verbatim"));
+    expect(restored).toHaveLength(1);
+    expect(restored[0]!.message).toContain("dropped 1 load-bearing literal");
+    // The pre-repair warning is gone: the gate reports the outcome, not a plan.
+    expect(notifications.some(n => n.message.includes("paraphrased"))).toBe(false);
+  });
+
+  it("reports the residue and keeps the draft when the repair rounds stay lossy", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    const lossy = successScript(LOSSY_DRAFT);
+    setScript(lossy);
+    // One initial draft plus one repair that splices its own unchanged section,
+    // which is what ends the loop.
+    queueScripts(lossy, lossy);
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual(["deriveVariantKey"]);
+    // The writer's response is trimmed before use, so the draft under discussion
+    // is the trimmed text; the section the gate could not fix is still byte-for-
+    // byte the section it started with.
+    expect(result.markdown).toBe(LOSSY_DRAFT.trimEnd());
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("spends no repair session when the draft keeps every literal", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(LOSSY_DRAFT.replace("- Update src/lossy.ts to rename the helper.", "- Rename the helper to `deriveVariantKey` in src/lossy.ts.")));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", LOSSY_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.checked).toBeGreaterThan(0);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.fidelity?.missingSections).toEqual(["Critical files & anchors"]);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("rewrites a delta's section again when the writer drops one of the delta's literals", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    const lossy = successScript("## Verification\n\n- The refresh tests pass.\n");
+    setScript(lossy);
+    queueScripts(lossy, successScript(REPAIRED_VERIFICATION));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandPlanUpdateToMarkdown(
+      pi,
+      ctx,
+      "@smol",
+      { slug: "auth-refresh", verification: ["`bun test tests/auth-refresh.test.ts` passes"] },
+      splitPlanSections("## Verification\n\n- `bun test tests/auth.test.ts` passes\n"),
+    );
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.markdown).toContain("`bun test tests/auth-refresh.test.ts`");
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("regenerates a dropped heading from its CHANGES alone and lists only real removals", async () => {
+    const { fakeSdk, setScript, lastSession } = createFakeSdk();
+    // The draft keeps the step's path, so the gate has no gap to repair and the
+    // sole session is the update session whose brief this test inspects.
+    setScript(successScript("## Approach\n\n- Rewrite `src/example.ts`.\n"));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandPlanUpdateToMarkdown(
+      pi,
+      ctx,
+      "@smol",
+      {
+        slug: "regen-plan",
+        drop: ["Approach", "Assumptions & contingencies"],
+        files: [["E", "src/example.ts", "example file"]],
+        steps: [["E", "~", [1, 2], "Rewrite the example export.", [], []]],
+      },
+      splitPlanSections(
+        "## Context\n\nContext text.\n\n## Approach\n\n- Old step.\n\n## Verification\n\n- `bun test` passes\n",
+      ),
+    );
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    const prompt = lastSession()!.lastPrompt ?? "";
+    // Approach is regenerated from scratch, so it is not a removal; the heading
+    // the delta does not supply stays in REMOVED SECTIONS.
+    const removalBlock = prompt.split("REMOVED SECTIONS (never emit these)\n")[1]!.split("\n===")[0]!;
+    expect(removalBlock).toContain("Assumptions & contingencies");
+    expect(removalBlock).not.toContain("Approach");
+
+    const sectionBlock = prompt.split("=== SECTION 1: Approach ===")[1]!;
+    expect(sectionBlock).toContain("CURRENT\n(no current content)");
+    expect(sectionBlock).toContain("CHANGES\n1. src/example.ts");
+    expect(result.markdown).toContain("Rewrite `src/example.ts`");
+  });
+
+  it("substitutes every declared marker and spends no repair session", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("/api/search-text");
+    expect(result.markdown).toContain("relation_not_allowed_for_entity");
+    expect(result.markdown).toContain("Invalid search plan");
+    // Every marker the extension could substitute is gone from the draft.
+    expect(result.markdown).not.toContain("[[");
+    expect(result.literalMetrics.resolved).toBe(3);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.literalMetrics.unresolved).toEqual([]);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("does not report a declared literal the draft carries in another section", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", CONTEXT_MARKER_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The Context paragraph of DECLARED_DRAFT dropped its marker, but the
+    // Approach section states the same value: the literal was relocated, not
+    // lost, so neither a repair session nor a missing literal is warranted.
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.markdown).toContain("Invalid search plan");
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("reports a marker no declared literal owns without stripping it", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(INVENTED_MARKER_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.literalMetrics.unresolved).toEqual(["L9"]);
+    expect(result.literalMetrics.resolved).toBe(3);
+    // The gate reports the marker; it never rewrites the draft.
+    expect(result.markdown).toContain("[[L9]]");
+    // Every declared literal survives, so the gate spent no repair round.
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("repairs a declared literal the writer paraphrased, substituting the exact value", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_REPAIR));
+    queueScripts(successScript(PARAPHRASED_DRAFT), successScript(DECLARED_REPAIR));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The repair brief hands the writer the `[[L2]]` marker and the extension
+    // substitutes the exact declared value afterwards.
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.literalMetrics.repairRounds).toBe(1);
+    expect(result.markdown).toContain("relation_not_allowed_for_entity");
+    expect(result.markdown).not.toContain("relation-not-permitted");
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("repairs a declared literal the writer omitted entirely", async () => {
+    const { fakeSdk, queueScripts, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_REPAIR));
+    queueScripts(successScript(OMITTED_DRAFT), successScript(DECLARED_REPAIR));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.literalMetrics.repairRounds).toBe(1);
+    expect(result.markdown).toContain("relation_not_allowed_for_entity");
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("reports the declared literal as residue when even the repair drops its marker", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    // Every session returns the same omitted-marker draft, so the repair cannot
+    // close the gap and the loop ends on the round that changes nothing.
+    setScript(successScript(OMITTED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.fidelity?.missing).toEqual(["relation_not_allowed_for_entity"]);
+    expect(result.fidelity?.repaired).toBe(true);
+    expect(result.literalMetrics.repairRounds).toBe(1);
+    expect(sessionCount()).toBe(2);
+  });
+
+  it("substitutes every occurrence of a marker the writer emitted twice", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DUPLICATE_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown.match(/\/api\/search-text/g)).toHaveLength(2);
+    expect(result.literalMetrics.resolved).toBe(4);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("passes a draft that rewrote the Context prose but kept its declared marker", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(REPHRASED_CONTEXT_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", CONTEXT_MARKER_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("Malformed search requests are now refused with the `Invalid search plan` error.");
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(result.literalMetrics.resolved).toBe(4);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("does not gate an undeclared inline literal once a table is declared", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript(DECLARED_DRAFT));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", UNDECLARED_CONTEXT_BLUEPRINT);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    // The declared table is the authoritative literal set, so the Context path
+    // no entry declares is never mined and its absence is not a gap.
+    expect(result.markdown).not.toContain("src/undeclared.ts");
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(result.fidelity?.repaired).toBe(false);
+    expect(sessionCount()).toBe(1);
   });
 });
 
@@ -349,6 +952,32 @@ describe("expandDocBlueprintToMarkdown", () => {
     expect(result.usage.output).toBe(60);
     expect(result.costUsd).toBeCloseTo(0.006, 8);
     expect(lastSessionDisposed()).toBe(true);
+  });
+
+  it("resolves a declared marker in a doc blueprint bullet without a repair session", async () => {
+    const { fakeSdk, setScript, sessionCount } = createFakeSdk();
+    setScript(successScript("# Test README\n\n## Usage\n\nRun [[L1]] to bring the stack up."));
+
+    const pi = makeApiWithSdk(fakeSdk);
+    const { ctx } = createFakeExtensionContext({ hasUI: false });
+
+    const blueprint: DocBlueprint = {
+      slug: "marked-readme",
+      title: "Test README",
+      path: "README.md",
+      sections: [{ heading: "Usage", bullets: ["Run [[L1]]."] }],
+      literals: [["L1", "bun start"]],
+    };
+
+    const result = await expandDocBlueprintToMarkdown(pi, ctx, "@smol", blueprint);
+    if (!("markdown" in result)) throw new Error("Expected markdown");
+
+    expect(result.markdown).toContain("bun start");
+    expect(result.markdown).not.toContain("[[");
+    expect(result.literalMetrics.resolved).toBe(1);
+    expect(result.literalMetrics.repairRounds).toBe(0);
+    expect(result.fidelity?.missing).toEqual([]);
+    expect(sessionCount()).toBe(1);
   });
 
   it("sends a UI notification mentioning doc-Markdown when ctx.hasUI is true", async () => {

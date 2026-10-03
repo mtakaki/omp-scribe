@@ -11,6 +11,12 @@ export type ScribeOperation = "+" | "!" | "~";
  *  one-line note on why the file matters. */
 export type ScribeFile = readonly [id: string, path: string, reason: string];
 
+/** [id, value] — one load-bearing literal the plan preserves verbatim.  The
+ *  planner writes the `[[id]]` marker where the value belongs; the writer emits
+ *  the marker and the extension substitutes `value`, so the writer never types
+ *  the value itself. */
+export type ScribeLiteral = readonly [id: string, value: string];
+
 /** [start, end] — an inclusive 1-based line range. */
 export type ScribeRange = readonly [start: number, end: number];
 
@@ -43,6 +49,37 @@ export interface PlanBlueprint {
   steps: readonly ScribeStep[];
   verification: readonly string[];
   assumptions: readonly string[];
+  /** Load-bearing literals the writer references as `[[id]]` markers and the
+   *  extension substitutes with the exact `value`. */
+  literals?: readonly ScribeLiteral[];
+}
+
+/** The compact delta the expensive model submits to revise an existing plan
+ *  document instead of rewriting it.
+ *
+ *  Every field names one plan section and, when supplied, is the new input for
+ *  that section; a field that is absent — and an empty array alike — means
+ *  "leave that section exactly as it is".  Section removal is expressed only
+ *  through `drop`, never by omitting a field.  `steps` reference file ids from
+ *  `files`, so the two travel together.  The extension rewrites just the named
+ *  sections with the cheap writer model and splices them into the plan file
+ *  already on disk, leaving every other section byte-identical. */
+export interface PlanUpdateBlueprint {
+  slug: string;
+  /** New input for the Context section. */
+  context?: string;
+  /** Files to add to the "Critical files & anchors" section. */
+  files?: readonly ScribeFile[];
+  /** Change steps to fold into the Approach section. */
+  steps?: readonly ScribeStep[];
+  /** Check bullets to add to the Verification section. */
+  verification?: readonly string[];
+  /** Decisions to add to the "Assumptions & contingencies" section. */
+  assumptions?: readonly string[];
+  /** Headings of sections to delete from the plan document. */
+  drop?: readonly string[];
+  /** Load-bearing literals this delta's sections reference as `[[id]]` markers. */
+  literals?: readonly ScribeLiteral[];
 }
 
 /** One section in the compact document blueprint. */
@@ -62,4 +99,6 @@ export interface DocBlueprint {
   /** Exact write target declared up front, e.g. "README.md" or "docs/ARCHITECTURE.md". */
   path: string;
   sections: DocBlueprintSection[];
+  /** Load-bearing literals the document references as `[[id]]` markers. */
+  literals?: readonly ScribeLiteral[];
 }

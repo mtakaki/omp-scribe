@@ -246,13 +246,14 @@ describe("resolveWriterModel", () => {
 // ─── registerScribeFlags ──────────────────────────────────────────────────────
 
 describe("registerScribeFlags", () => {
-  it("registers exactly two flags with the expected names", () => {
+  it("registers exactly three flags with the expected names", () => {
     const { pi, flags } = createFakeExtensionApi();
     registerScribeFlags(pi);
     const names = flags.map(f => f.name);
     expect(names).toContain("scribe-brain-model");
     expect(names).toContain("scribe-writer-model");
-    expect(flags).toHaveLength(2);
+    expect(names).toContain("scribe-token-report");
+    expect(flags).toHaveLength(3);
   });
 
   it("scribe-writer-model has default '@smol'", () => {
@@ -260,6 +261,14 @@ describe("registerScribeFlags", () => {
     registerScribeFlags(pi);
     const writerFlag = flags.find(f => f.name === "scribe-writer-model");
     expect(writerFlag?.options["default"]).toBe("@smol");
+  });
+
+  it("scribe-token-report is a boolean defaulting to false", () => {
+    const { pi, flags } = createFakeExtensionApi();
+    registerScribeFlags(pi);
+    const reportFlag = flags.find(f => f.name === "scribe-token-report");
+    expect(reportFlag?.options["type"]).toBe("boolean");
+    expect(reportFlag?.options["default"]).toBe(false);
   });
 });
 
@@ -333,6 +342,15 @@ describe("readScribeConfig", () => {
     const cfg = await readScribeConfig(pi, cwd);
     expect(cfg.writerModel).toBe(DEFAULT_WRITER_MODEL);
   });
+
+  it("reports tokenReport false by default and true when the diagnostic flag is set", async () => {
+    const { pi, flagValues } = createFakeExtensionApi();
+    registerScribeFlags(pi);
+    expect((await readScribeConfig(pi, cwd)).tokenReport).toBe(false);
+
+    flagValues.set("scribe-token-report", true);
+    expect((await readScribeConfig(pi, cwd)).tokenReport).toBe(true);
+  });
 });
 
 // ─── Persisted per-project writer model ──────────────────────────────────────
@@ -394,8 +412,8 @@ describe("writePersistedScribeConfig", () => {
 // ─── formatScribeStatus ──────────────────────────────────────────────────────
 
 describe("formatScribeStatus", () => {
-  const cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL };
-  const custom: ScribeConfig = { brainModel: undefined, writerModel: "anthropic/claude-haiku-3-5" };
+  const cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL, tokenReport: false };
+  const custom: ScribeConfig = { brainModel: undefined, writerModel: "anthropic/claude-haiku-3-5", tokenReport: false };
 
   it("renders the idle line with the configured writer spec", () => {
     expect(formatScribeStatus(cfg, { kind: "idle" })).toBe("Scribe ○ idle (writer: @smol)");

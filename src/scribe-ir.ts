@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import type { PlanBlueprint, ScribeOperation } from "./types";
+import type { ScribeFile, ScribeOperation, ScribeStep } from "./types";
 
 /**
  * Scribe IR resolution/validation/hydration — the counterpart to the compact
@@ -28,10 +28,39 @@ export interface ScribeStepResolved {
   doNot: readonly string[];
 }
 
+/** Whether the reader's own file read found the step's target: `exists` when
+ *  the file was read, `absent` when the read failed with `ENOENT` (so the
+ *  step authors a new file), and `unknown` when a read failed for any other
+ *  reason or the path escaped the project root.  The brief renders
+ *  `lines: (new file)` only for `absent`, so a file that merely could not be
+ *  read is never misreported as a creation. */
+export type ScribeFileState = "exists" | "absent" | "unknown";
+
 /** A resolved step plus the file content it references. */
 export interface HydratedScribeStep {
   step: ScribeStepResolved;
+  /** Whether the step's target file was found on disk; see {@link ScribeFileState}. */
+  fileState: ScribeFileState;
   snippet: string;
+}
+
+/** The two IR fields validation and resolution actually inspect.  Both the full
+ *  {@link PlanBlueprint} and a `PlanUpdateBlueprint` delta satisfy this shape, so
+ *  one validator serves the initial blueprint and the update path alike. */
+export interface ScribeIrBlueprint {
+  readonly files: readonly ScribeFile[];
+  readonly steps: readonly ScribeStep[];
+}
+
+/** What an IR submission may omit.  `requireSteps` defaults to `true`, which is
+ *  the initial-blueprint contract; the update path passes `false` so a delta
+ *  that only touches `context`/`verification`/`drop` validates without inventing
+ *  steps. */
+export interface ScribeValidationOptions {
+  /** When `false`, an empty `steps` array is valid; every other check — file
+   *  tuples, step tuples, ID cross-references, operations, range ordering, and
+   *  preserve/doNot entries — still applies. */
+  requireSteps?: boolean;
 }
 
 /** Validates `blueprint.files`/`blueprint.steps` structurally, throwing a
@@ -43,7 +72,10 @@ export interface HydratedScribeStep {
  *  the sole place that checks per-position types, operation membership,
  *  range ordering, and the fileId cross-reference — not just the
  *  cross-field reference the schema genuinely cannot express. */
-export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
+export function validateScribeBlueprint(
+  blueprint: ScribeIrBlueprint,
+  options: ScribeValidationOptions = { requireSteps: true },
+): void {
   const seenIds = new Set<string>();
   blueprint.files.forEach((file, index) => {
     if (!Array.isArray(file) || file.length !== 3) {
@@ -61,7 +93,9 @@ export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
     }
   });
 
-  if (blueprint.steps.length === 0) throw new Error("steps must contain at least one step.");
+  if (blueprint.steps.length === 0 && options.requireSteps !== false) {
+    throw new Error("steps must contain at least one step.");
+  }
 
   blueprint.steps.forEach((entry, index) => {
     if (!Array.isArray(entry) || entry.length !== 6) {
@@ -106,7 +140,7 @@ export function validateScribeBlueprint(blueprint: PlanBlueprint): void {
 
 /** Resolves file IDs to paths and assigns each step a stable `S<n>` id.
  *  Call only after {@link validateScribeBlueprint} has passed. */
-export function resolveScribeSteps(blueprint: PlanBlueprint): ScribeStepResolved[] {
+export function resolveScribeSteps(blueprint: ScribeIrBlueprint): ScribeStepResolved[] {
   const pathById = new Map(blueprint.files.map(([id, path]) => [id, path] as const));
   return blueprint.steps.map(([fileId, operation, range, intent, preserve, doNot], index) => {
     const filePath = pathById.get(fileId);
@@ -124,7 +158,15 @@ export function resolveScribeSteps(blueprint: PlanBlueprint): ScribeStepResolved
 }
 
 /** Longest excerpt hydrated for one step, in lines. */
-const MAX_SNIPPET_LINES = 200;
+export const MAX_SNIPPET_LINES = 200;
+
+/** Longest excerpt hydrated for a step that names no line range and only adds
+ *  to its file.  Such a step has no range to ground the writer in, so its
+ *  snippet is the file's head — enough to carry the file's own style and
+ *  imports — and the writer has no line range to quote either way.  Ranged
+ *  steps and unranged "~"/"!" steps keep {@link MAX_SNIPPET_LINES}: their
+ *  snippet is the subject of the change, not background. */
+export const MAX_UNRANGED_SNIPPET_LINES = 40;
 
 /** Reads the lines a step references so the writer model can ground its prose
  *  in real code. `projectRoot` is the session cwd; `step.filePath` is resolved
@@ -135,7 +177,7 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   const root = resolve(projectRoot);
   const target = resolve(root, step.filePath);
   if (target !== root && !target.startsWith(root + sep)) {
-    return { step, snippet: `(no snippet: ${step.filePath} resolves outside the project root)` };
+    return { step, fileState: "unknown", snippet: `(no snippet: ${step.filePath} resolves outside the project root)` };
   }
 
   let text: string;
@@ -149,7 +191,7 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
         : code === "EISDIR"
           ? "is a directory, not a file"
           : `could not be read (${code ?? (error instanceof Error ? error.message : String(error))})`;
-    return { step, snippet: `(no snippet: ${step.filePath} ${reason})` };
+    return { step, fileState: code === "ENOENT" ? "absent" : "unknown", snippet: `(no snippet: ${step.filePath} ${reason})` };
   }
 
   const lines = text.split(/\r?\n/);
@@ -160,17 +202,19 @@ export async function hydrateScribeStep(projectRoot: string, step: ScribeStepRes
   if (from > lines.length) {
     return {
       step,
+      fileState: "exists",
       snippet: `(no snippet: ${step.filePath} has only ${lines.length} lines, but lines ${from}-${to} were requested)`,
     };
   }
 
   const available = Math.min(to, lines.length);
-  const emitTo = Math.min(available, from + MAX_SNIPPET_LINES - 1);
+  const cap = step.lineRange === undefined && step.operation === "+" ? MAX_UNRANGED_SNIPPET_LINES : MAX_SNIPPET_LINES;
+  const emitTo = Math.min(available, from + cap - 1);
   const excerpt: string[] = [];
   for (let n = from; n <= emitTo; n++) excerpt.push(`${String(n).padStart(5)}| ${lines[n - 1]}`);
 
   const notes: string[] = [];
   if (to > lines.length) notes.push(`lines ${lines.length + 1}-${to} were requested but ${step.filePath} ends at line ${lines.length}`);
   if (available > emitTo) notes.push(`${available - emitTo} further lines omitted`);
-  return { step, snippet: notes.length === 0 ? excerpt.join("\n") : `${excerpt.join("\n")}\n(${notes.join("; ")})` };
+  return { step, fileState: "exists", snippet: notes.length === 0 ? excerpt.join("\n") : `${excerpt.join("\n")}\n(${notes.join("; ")})` };
 }
