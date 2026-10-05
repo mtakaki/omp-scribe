@@ -236,10 +236,10 @@ describe("buildRepairPromptText", () => {
     );
 
     expect(brief).toContain("LITERALS (each marker below must appear in your response exactly where its value belongs");
-    expect(brief).toContain('[[L1]] = "/api/search-text"');
-    expect(brief).toContain('[[L2]] = "relation_not_allowed_for_entity"');
+    expect(brief).toContain('[[lit:L1]] = "/api/search-text"');
+    expect(brief).toContain('[[lit:L2]] = "relation_not_allowed_for_entity"');
     // A declared value is named by its marker; an undeclared one stays backticked.
-    expect(brief).toContain("- [[L2]] = \"relation_not_allowed_for_entity\"");
+    expect(brief).toContain("- [[lit:L2]] = \"relation_not_allowed_for_entity\"");
     expect(brief).toContain("- `src/auth.ts`");
   });
 
@@ -280,20 +280,24 @@ The taxonomy API is being renamed.
     expect(removeLiteralDumpLines(DUMPED_SECTION)).toBe("## Context\n\nThe taxonomy API is being renamed.\n");
   });
 
-  it("treats a line that is nothing but [[id]] markers as a literal-only line", () => {
-    expect(literalDumpLines("- [[L1]]\n- [[L2]], [[L3]]\nthe plan states [[L1]] in prose.")).toEqual([
-      "- [[L1]]",
-      "- [[L2]], [[L3]]",
+  it("treats a line that is nothing but [[lit:<id>]] markers as a literal-only line", () => {
+    expect(literalDumpLines("- [[lit:L1]]\n- [[lit:L2]], [[lit:L3]]\nthe plan states [[lit:L1]] in prose.")).toEqual([
+      "- [[lit:L1]]",
+      "- [[lit:L2]], [[lit:L3]]",
     ]);
-    expect(removeLiteralDumpLines("- [[L1]]\nthe plan states [[L1]] in prose.")).toBe(
-      "the plan states [[L1]] in prose.",
+    expect(removeLiteralDumpLines("- [[lit:L1]]\nthe plan states [[lit:L1]] in prose.")).toBe(
+      "the plan states [[lit:L1]] in prose.",
     );
+  });
+
+  it("keeps a line of bare double-bracket project syntax out of the residue", () => {
+    expect(literalDumpLines("- [[env.staging.analytics_engine_datasets]]\n- [[routes]]")).toEqual([]);
   });
 });
 
 describe("resolveLiteralPlaceholders", () => {
   it("resolves a known marker to its exact value and counts each occurrence", () => {
-    const resolution = resolveLiteralPlaceholders("Request `[[L1]]` returns [[L2]].", TABLE);
+    const resolution = resolveLiteralPlaceholders("Request `[[lit:L1]]` returns [[lit:L2]].", TABLE);
 
     expect(resolution.markdown).toBe("Request `/api/search-text` returns relation_not_allowed_for_entity.");
     expect(resolution.resolved).toBe(2);
@@ -301,23 +305,39 @@ describe("resolveLiteralPlaceholders", () => {
   });
 
   it("resolves every occurrence of a repeated marker", () => {
-    const resolution = resolveLiteralPlaceholders("[[L1]] then [[L1]]", TABLE);
+    const resolution = resolveLiteralPlaceholders("[[lit:L1]] then [[lit:L1]]", TABLE);
 
     expect(resolution.markdown).toBe("/api/search-text then /api/search-text");
     expect(resolution.resolved).toBe(2);
   });
 
   it("leaves an unknown id byte-identical and records its body once", () => {
-    const resolution = resolveLiteralPlaceholders("[[L9]] and [[L9]] and [unclosed] and [[L2]]", TABLE);
+    const resolution = resolveLiteralPlaceholders(
+      "[[lit:L9]] and [[lit:L9]] and [unclosed] and [[lit:L2]]",
+      TABLE,
+    );
 
-    expect(resolution.markdown).toBe("[[L9]] and [[L9]] and [unclosed] and relation_not_allowed_for_entity");
+    expect(resolution.markdown).toBe(
+      "[[lit:L9]] and [[lit:L9]] and [unclosed] and relation_not_allowed_for_entity",
+    );
     expect(resolution.unresolved).toEqual(["L9"]);
     expect(resolution.resolved).toBe(1);
   });
 
+  it("leaves a double-bracket span without the sentinel untouched and unrecorded", () => {
+    const resolution = resolveLiteralPlaceholders(
+      "see [[env.staging.analytics_engine_datasets]] and [[routes]]",
+      TABLE,
+    );
+
+    expect(resolution.markdown).toBe("see [[env.staging.analytics_engine_datasets]] and [[routes]]");
+    expect(resolution.resolved).toBe(0);
+    expect(resolution.unresolved).toEqual([]);
+  });
+
   it("matches an id case-insensitively and round-trips a long multi-line value", () => {
     const value = `${"x".repeat(220)}\nsecond line`;
-    const resolution = resolveLiteralPlaceholders("[[l1]]", [["L1", value]]);
+    const resolution = resolveLiteralPlaceholders("[[lit:l1]]", [["L1", value]]);
 
     expect(resolution.markdown).toBe(value);
     expect(resolution.resolved).toBe(1);
@@ -325,9 +345,9 @@ describe("resolveLiteralPlaceholders", () => {
   });
 
   it("never re-scans a substituted value that itself contains marker syntax", () => {
-    const resolution = resolveLiteralPlaceholders("[[L1]]", [["L1", "[[L2]]"], ["L2", "leaked"]]);
+    const resolution = resolveLiteralPlaceholders("[[lit:L1]]", [["L1", "[[lit:L2]]"], ["L2", "leaked"]]);
 
-    expect(resolution.markdown).toBe("[[L2]]");
+    expect(resolution.markdown).toBe("[[lit:L2]]");
     expect(resolution.resolved).toBe(1);
     expect(resolution.unresolved).toEqual([]);
   });
@@ -335,23 +355,30 @@ describe("resolveLiteralPlaceholders", () => {
 
 describe("literalMarkers / referencedLiterals", () => {
   it("returns trimmed marker bodies in reading order, de-duplicated case-insensitively", () => {
-    expect(literalMarkers("[[L1]] then [[ L2 ]] then [[l1]]")).toEqual(["L1", "L2"]);
+    expect(literalMarkers("[[lit:L1]] then [[lit: L2 ]] then [[lit:l1]]")).toEqual(["L1", "L2"]);
   });
 
   it("returns nothing for text with no marker span", () => {
     expect(literalMarkers("plain [brackets] and `code`")).toEqual([]);
   });
 
+  it("ignores a double-bracket span that carries no lit: sentinel but reads the sentinel form", () => {
+    const quoted = "wrangler.toml needs [[env.staging.analytics_engine_datasets]] and the route [[routes]]";
+
+    expect(literalMarkers(quoted)).toEqual([]);
+    expect(literalMarkers(`${quoted} plus [[lit:routes]]`)).toEqual(["routes"]);
+  });
+
   it("returns the declared values a text references, in table order", () => {
-    expect(referencedLiterals("use [[L2]] and [[L1]]", TABLE)).toEqual([
+    expect(referencedLiterals("use [[lit:L2]] and [[lit:L1]]", TABLE)).toEqual([
       "/api/search-text",
       "relation_not_allowed_for_entity",
     ]);
   });
 
   it("returns nothing for an absent or empty table", () => {
-    expect(referencedLiterals("[[L1]]", undefined)).toEqual([]);
-    expect(referencedLiterals("[[L1]]", [])).toEqual([]);
+    expect(referencedLiterals("[[lit:L1]]", undefined)).toEqual([]);
+    expect(referencedLiterals("[[lit:L1]]", [])).toEqual([]);
   });
 });
 
@@ -361,11 +388,11 @@ describe("formatLiteralTable", () => {
     expect(formatLiteralTable([])).toEqual([]);
   });
 
-  it("renders a header, one [[id]] = <json> line per entry, and a blank line", () => {
+  it("renders a header, one [[lit:<id>]] = <json> line per entry, and a blank line", () => {
     expect(formatLiteralTable([["L1", "/api/search-text"], ["L2", 'say "hi"']])).toEqual([
       "LITERALS (each marker below must appear in your response exactly where its value belongs; Scribe substitutes the exact value afterwards — never type the value yourself)",
-      '[[L1]] = "/api/search-text"',
-      '[[L2]] = "say \\"hi\\""',
+      '[[lit:L1]] = "/api/search-text"',
+      '[[lit:L2]] = "say \\"hi\\""',
       "",
     ]);
   });
@@ -453,44 +480,67 @@ describe("validateLiteralUsage", () => {
   it("accepts an absent or empty table, and a table whose ids are referenced", () => {
     expect(() => validateLiteralUsage(undefined, ["prose with no marker"])).not.toThrow();
     expect(() => validateLiteralUsage([], ["prose"])).not.toThrow();
-    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[L1]] here"])).not.toThrow();
+    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[lit:L1]] here"])).not.toThrow();
   });
 
   it("accepts a marker whose case differs from the declared id", () => {
-    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[l1]] here"])).not.toThrow();
+    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[lit:l1]] here"])).not.toThrow();
+  });
+
+  it("accepts prose quoting a bare double-bracket span when its own declared marker is referenced", () => {
+    const table: ScribeLiteral[] = [["TOML", "[[env.staging.analytics_engine_datasets]]"]];
+
+    expect(() =>
+      validateLiteralUsage(table, [
+        "Add the [[lit:TOML]] table header to wrangler.toml.",
+        "Quote [[env.staging.analytics_engine_datasets]] and [[routes]] verbatim.",
+      ]),
+    ).not.toThrow();
   });
 
   it("throws naming every id no marker references", () => {
     expect(() => validateLiteralUsage([["L1", "x"], ["L2", "y"]], ["plain prose with no marker"])).toThrow(
-      'literals: "L1", "L2" declared but never referenced as [[<id>]] in the blueprint\'s prose; reference each one where its value belongs, or drop it.',
+      'literals: "L1", "L2" declared but never referenced as [[lit:<id>]] in the blueprint\'s prose; reference each one where its value belongs, or drop it.',
     );
   });
 
   it("rejects a marker no declared literal owns, table or none", () => {
     const expected =
-      "literals: the blueprint's prose uses [[emailsKey]], [[policyName]] but no literal declares them; declare each id with the exact value it stands for, or drop the marker.";
+      "literals: the blueprint's prose uses [[lit:emailsKey]], [[lit:policyName]] but no literal declares them; declare each id with the exact value it stands for, or drop the marker.";
 
     // The reported failure: markers written, no table declared at all.
-    expect(() => validateLiteralUsage([], ["Context names [[emailsKey]] and [[policyName]]."])).toThrow(expected);
+    expect(() => validateLiteralUsage([], ["Context names [[lit:emailsKey]] and [[lit:policyName]]."])).toThrow(
+      expected,
+    );
     // An omitted table reaches the validator the same way.
-    expect(() => validateLiteralUsage(undefined, ["Context names [[emailsKey]] and [[policyName]]."])).toThrow(expected);
+    expect(() => validateLiteralUsage(undefined, ["Context names [[lit:emailsKey]] and [[lit:policyName]]."])).toThrow(
+      expected,
+    );
   });
 
   it("reads the singular form for one undeclared marker", () => {
-    expect(() => validateLiteralUsage([], ["files: [[emailsKey]]"])).toThrow(
-      "literals: the blueprint's prose uses [[emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
+    expect(() => validateLiteralUsage([], ["files: [[lit:emailsKey]]"])).toThrow(
+      "literals: the blueprint's prose uses [[lit:emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
     );
   });
 
   it("names only the undeclared remainder of a partly declared set", () => {
-    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[L1]] and [[L9]]"])).toThrow(
-      "literals: the blueprint's prose uses [[L9]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
+    expect(() => validateLiteralUsage([["L1", "x"]], ["uses [[lit:L1]] and [[lit:L9]]"])).toThrow(
+      "literals: the blueprint's prose uses [[lit:L9]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
     );
   });
 
   it("names a repeated or differently cased marker once", () => {
-    expect(() => validateLiteralUsage([], ["[[emailsKey]] then [[emailsKey]] then [[EMAILSKEY]]"])).toThrow(
-      "literals: the blueprint's prose uses [[emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
+    expect(() =>
+      validateLiteralUsage([], ["[[lit:emailsKey]] then [[lit:emailsKey]] then [[lit:EMAILSKEY]]"]),
+    ).toThrow(
+      "literals: the blueprint's prose uses [[lit:emailsKey]] but no literal declares it; declare each id with the exact value it stands for, or drop the marker.",
     );
+  });
+
+  it("leaves a bare double-bracket span out of the undeclared check", () => {
+    expect(() =>
+      validateLiteralUsage([["L1", "x"]], ["uses [[lit:L1]] and quotes [[routes]] verbatim"]),
+    ).not.toThrow();
   });
 });

@@ -40,8 +40,9 @@ export interface SavingsRunLogEntry {
    *  model's rates because the live brain model had no catalog rate of its own;
    *  absent in legacy entries (treat as `false`). */
   baselineIsEstimate?: boolean;
-  /** `[[id]]` markers the extension substituted with their declared literal
-   *  value, counted per occurrence.  Zero for a run that declared no table. */
+  /** `[[lit:<id>]]` markers the extension substituted with their declared
+   *  literal value, counted per occurrence.  Zero for a run that declared no
+   *  table. */
   literalResolved?: number;
   /** LLM literal-repair rounds the fidelity gate ran for this run.  A declared
    *  literal the writer omitted is reported, never repaired, so the usual value
@@ -100,8 +101,8 @@ export interface SavingsStatsFile {
   /** Count of blueprint tool calls whose result was an error (the writer
    *  expansion failed). Required for the same reason as `blueprintCallsTotal`. */
   blueprintCallsFailed: number;
-  /** Cumulative `[[id]]` markers substituted deterministically; optional for
-   *  backward compat with earlier files. */
+  /** Cumulative `[[lit:<id>]]` markers substituted deterministically; optional
+   *  for backward compat with earlier files. */
   totalLiteralResolved?: number;
   /** Cumulative LLM literal-repair rounds; optional for backward compat. */
   totalLlmRepairCalls?: number;
@@ -386,7 +387,7 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
   );
 
   lines.push(
-    `ℹ  Literals are declared in the planner's "literals" table and referenced as [[id]] markers, so the extension ` +
+    `ℹ  Literals are declared in the planner's "literals" table and referenced as [[lit:<id>]] markers, so the extension ` +
       `substitutes them deterministically; an LLM literal-repair call runs only for a literal the planner never declared.`,
   );
 

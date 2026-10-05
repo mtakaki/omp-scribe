@@ -39,7 +39,7 @@ import {
   planUpdateHeadings,
   planUpdateRemovals,
 } from "./writer-session";
-import type { FidelityReport, LiteralRunMetrics } from "./literal-fidelity";
+import { formatLiteralMarker, type FidelityReport, type LiteralRunMetrics } from "./literal-fidelity";
 import { computeCosts } from "./pricing";
 import {
   appendBlueprintFailure,
@@ -53,12 +53,12 @@ import {
 
 const SCRIBE_DIRECTIVE = `<scribe>
 Cost control is active for this plan turn: never compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown). Its parameters are documented on the tool: slug, title, context, verification, assumptions, literals, files, steps. Declare each exact string the plan must preserve character-for-character once in literals — [id, value] pairs, id 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case, value the exact text of at most 8000 characters. Where a declared value belongs, write the marker [[<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once; the extension substitutes the exact value after the writer's response, so the writer never types it. Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown). Its parameters are documented on the tool: slug, title, context, verification, assumptions, literals, files, steps. Declare each exact string the plan must preserve character-for-character once in literals — [id, value] pairs, id 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case, value the exact text of at most 8000 characters. Where a declared value belongs, write the marker [[lit:<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once; the extension substitutes the exact value after the writer's response, so the writer never types it. Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
 2. Then call \`write\` with path \`local://<slug>-plan.md\` (the slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown before the write executes. Use \`write\` even when the plan file already exists: the draft replaces it completely, so never edit in place.
 3. The tool result reports literal fidelity — "verified verbatim", or the exact literals the draft lost — as machine-checked evidence: do NOT re-read the plan file and do NOT re-check it against your blueprint. If literals are still listed missing after the repair pass, record the gap with \`${PLAN_UPDATE_TOOL_NAME}\` instead of reading the file back.
-4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete (naming a heading in both drop and the field that supplies it regenerates that section from scratch). Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
+4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[lit:<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete (naming a heading in both drop and the field that supplies it regenerates that section from scratch). Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
 5. Then continue the normal \`xd://propose\` submission with that slug.
-Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
+Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, fix exactly the problem it names and call that tool once more; only a second failure means write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>`;
 
 const DOC_SCRIBE_DIRECTIVE = `<scribe-doc>
@@ -114,7 +114,7 @@ function formatFidelityLine(fidelity: FidelityReport | undefined, metrics: Liter
     );
   }
   if (unresolved.length > 0) {
-    const shown = unresolved.slice(0, MAX_REPORTED_MISSING_LITERALS).map(id => `[[${id}]]`).join(", ");
+    const shown = unresolved.slice(0, MAX_REPORTED_MISSING_LITERALS).map(id => formatLiteralMarker(id)).join(", ");
     const more = unresolved.length - MAX_REPORTED_MISSING_LITERALS;
     parts.push(
       `Scribe could not resolve ${unresolved.length} marker${unresolved.length === 1 ? "" : "s"} the draft carries: ${shown}${more > 0 ? ` and ${more} more` : ""}; declare each id in the literals table with the exact value it stands for, or re-record the section that carries it with ${PLAN_UPDATE_TOOL_NAME}.`,
@@ -145,15 +145,15 @@ const PLAN_MODE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDAT
  *  can only verify literals a step names, and the writer can only reproduce
  *  what it is handed verbatim, so a literal left implicit in the intent's prose
  *  may legitimately be paraphrased away.  A marker no declared literal owns can
- *  never be substituted, so it would ship as literal `[[id]]` text — hence the
- *  declaration rule. */
+ *  never be substituted, so it would ship as literal `[[lit:<id>]]` text — hence
+ *  the declaration rule. */
 const STEP_LITERAL_REQUIREMENT =
-  "Declare every load-bearing literal this step relies on in literals and write its [[<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim, and a marker no declared literal owns is rejected.";
+  "Declare every load-bearing literal this step relies on in literals and write its [[lit:<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim, and a marker no declared literal owns is rejected.";
 
 /** `literals` parameter description shared by all three blueprint tools, so the
  *  declaration grammar can never drift between them. */
 const LITERALS_PARAM_DESCRIPTION =
-  "Load-bearing literals: 2-element [id, value] tuples (id: 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case; value: the exact string to keep verbatim, max 8000 chars). Write each value's [[<id>]] marker where the value belongs, and reference every declared id; the extension substitutes it.";
+  "Load-bearing literals: 2-element [id, value] tuples (id: 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case; value: the exact string to keep verbatim, max 8000 chars). Write each value's [[lit:<id>]] marker where the value belongs, and reference every declared id; the extension substitutes it.";
 
 /** Writer identity recorded for a draft the extension produces itself: a
  *  drop-only plan update deletes sections and regenerates none, so no writer

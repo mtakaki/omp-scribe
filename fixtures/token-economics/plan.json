@@ -13,8 +13,8 @@
     ["D", "tests/auth/session-store-cases.ts", "existing coverage for rotation and revocation"]
   ],
   "steps": [
-    ["A", "~", [42, 67], "Rotate the signing key on every refresh and reissue the [[A1]] cookie under the rotated key.", ["preserve the existing cookie attributes"], ["do not touch the legacy v1 verifier"]],
-    ["A", "~", [88, 96], "Reject a refresh whose nonce was already consumed and return the [[A2]] error code.", [], []],
+    ["A", "~", [42, 67], "Rotate the signing key on every refresh and reissue the [[lit:A1]] cookie under the rotated key.", ["preserve the existing cookie attributes"], ["do not touch the legacy v1 verifier"]],
+    ["A", "~", [88, 96], "Reject a refresh whose nonce was already consumed and return the [[lit:A2]] error code.", [], []],
     ["B", "~", [15, 40], "Resolve the plan role from modelRoles.plan before the writable-mode handoff.", ["preserve the current role precedence"], ["do not change the default writer role"]],
     ["B", "+", null, "Add a capability probe that reads the catalog once per session and caches the result.", [], []],
     ["C", "~", [61, 88], "Thread the hydrated snippet text into the token accounting so the diagnostic can report snippets apart from the rest of the brief.", [], []],
@@ -23,10 +23,10 @@
   ],
   "verification": [
     "bun test tests/auth/session-store-cases.ts passes with the rotation and revocation cases green",
-    "grep for [[A2]] under src/auth returns exactly one call site"
+    "grep for [[lit:A2]] under src/auth returns exactly one call site"
   ],
   "assumptions": [
-    "The cookie name stays [[A1]] because the host already scopes it to the session subdomain",
+    "The cookie name stays [[lit:A1]] because the host already scopes it to the session subdomain",
     "Nonce storage may stay in memory: the session store is process-local"
   ]
 }

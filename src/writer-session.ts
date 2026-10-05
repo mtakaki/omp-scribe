@@ -32,7 +32,7 @@ The APPROACH STEPS are authoritative.
 Brief labels:
 TITLE - plan title; becomes the "# " heading.
 CONTEXT - the ask and intended end state.
-LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for in the brief.
+LITERALS - optional; each line \`[[lit:<id>]] = <json value>\` is the exact value that marker stands for in the brief.
 APPROACH STEPS - numbered steps: target file path, operation (add | delete | modify), lines (an inclusive range, or "(new file)" only when the brief marks the step as creating the file, or "(no range given)" otherwise), intent (one sentence stating the change), optional preserve (semicolon-separated must-keep items), do not (semicolon-separated prohibitions), and source (the referenced lines, or a note that nothing could be read).
 FILES - optional pointers, one per touched file.
 VERIFICATION / ASSUMPTIONS - optional check bullets / user-overridable decisions.
@@ -48,7 +48,7 @@ Per step:
 8. Add no step the brief does not list.
 9. If source and intent conflict, describe the conflict instead of guessing.
 10. Turn no source observation into a requirement unless the brief states it.
-11. Where the brief writes a \`[[<id>]]\` marker, emit it verbatim — never the value it stands for, never a marker the LITERALS block does not list; the extension substitutes the exact value afterwards.
+11. Where the brief writes a \`[[lit:<id>]]\` marker, emit it verbatim — never the value it stands for, never a marker the LITERALS block does not list; the extension substitutes the exact value afterwards.
 12. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
 13. Call a step a new file only when its lines label reads "(new file)"; when it reads "(no range given)", the step edits a file that already exists, so never call it new or describe creating it.
 14. State each fact once: never repeat a sentence, clause, or list item.
@@ -76,14 +76,14 @@ Expand tersely into full sentences: add no content the brief does not supply, an
 
 export const DOC_WRITER_SYSTEM_PROMPT = `You expand compact JSON document outlines into complete Markdown documents. Respond to the user message — one JSON object — with ONLY the finished Markdown document: no preamble, no code fences, no commentary.
 
-Prefix it with "# <title>" from the JSON "title", then emit one "## <heading>" per "sections" entry, followed by that entry's bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and invent nothing beyond the bullets. The payload may carry a "literals" array of [id, value] tuples: a bullet's \`[[<id>]]\` marker stands for that entry's exact value. Emit every marker verbatim where its value belongs — never the value itself, never an unlisted marker, and never a marker or literal on a line by itself.`;
+Prefix it with "# <title>" from the JSON "title", then emit one "## <heading>" per "sections" entry, followed by that entry's bullets expanded tersely into full prose paragraphs. Preserve the section order exactly and invent nothing beyond the bullets. The payload may carry a "literals" array of [id, value] tuples: a bullet's \`[[lit:<id>]]\` marker stands for that entry's exact value. Emit every marker verbatim where its value belongs — never the value itself, never an unlisted marker, and never a marker or literal on a line by itself.`;
 
 export const PLAN_UPDATE_WRITER_SYSTEM_PROMPT = `You revise named sections of an existing Markdown implementation plan. Respond to the user message — one labelled plain-text brief — with ONLY the rewritten sections: each requested heading's "## <heading>" line spelled as the brief spells it, then its new body. No "# " title, no preamble, no code fences, no commentary.
 
 Brief labels:
 REQUESTED SECTIONS - the headings to emit, in order.
 REMOVED SECTIONS - headings the plan is dropping; never emit them.
-LITERALS - optional; each line \`[[<id>]] = <json value>\` is the exact value that marker stands for.
+LITERALS - optional; each line \`[[lit:<id>]] = <json value>\` is the exact value that marker stands for.
 Per requested section:
     CURRENT - the section's present Markdown, or "(no current content)".
     CHANGES - the new input: a paragraph to fold into Context; bullets to fold into a checklist section (a Critical files & anchors bullet is a backtick-quoted path, the operation when printed, and the reason, " — "-separated); or step blocks for added or corrected Approach steps (target file path, operation: add | delete | modify, lines: an inclusive range, "(new file)" only when the brief marks the step as creating the file, or "(no range given)" otherwise, intent: one sentence, optional preserve / do not lists, source: the referenced lines or a note that nothing could be read).
@@ -98,7 +98,7 @@ Rules:
 7. Treat preserve items as hard constraints and do-not items as explicit prohibitions.
 8. Infer no requirements from the source code; invent no files, details, APIs, behavior, or steps the brief does not supply.
 9. Reference no section the brief does not request.
-10. Emit any \`[[<id>]]\` marker the brief writes verbatim: the extension substitutes the exact value afterwards. Never write the value it stands for, and never invent an unlisted marker.
+10. Emit any \`[[lit:<id>]]\` marker the brief writes verbatim: the extension substitutes the exact value afterwards. Never write the value it stands for, and never invent an unlisted marker.
 11. Emit every supplied marker inside a sentence stating its role; never a marker or literal alone on a line.
 12. Call a step a new file only when its lines label reads "(new file)"; when it reads "(no range given)", the step edits a file that already exists, so never call it new or describe creating it.
 13. State each fact once: never repeat a sentence, clause, or list item.
@@ -108,8 +108,8 @@ You are a renderer, not a planner. Expand tersely into full sentences: add no co
 /** A completed writer expansion: the Markdown it produced, the model that
  *  produced it, the tokens and dollars it spent, the literal-fidelity gate's
  *  verdict on the result, and what the literal table cost.  `literalMetrics`
- *  counts the `[[id]]` markers substituted deterministically while the repair
- *  fields cover only the literals no table entry declares. */
+ *  counts the `[[lit:<id>]]` markers substituted deterministically while the
+ *  repair fields cover only the literals no table entry declares. */
 export interface ExpandSuccess {
   markdown: string;
   model: { provider: string; id: string };
@@ -346,8 +346,8 @@ export const MAX_FIDELITY_REPAIR_ROUNDS = 2;
 /** One brief-supplied plan section, ready for literal extraction: the heading
  *  the draft must carry it under, and the text it is written from.
  *  `extractInline` mines that text for literal-shaped strings as well as the
- *  declared `[[id]]` markers it references — false for a refinement's Context
- *  paragraph, whose wording legitimately changes while its markers stay
+ *  declared `[[lit:<id>]]` markers it references — false for a refinement's
+ *  Context paragraph, whose wording legitimately changes while its markers stay
  *  required, and ignored entirely once the caller declares a literal table,
  *  because the table is then the authoritative literal set. */
 interface FidelitySource {
@@ -390,7 +390,7 @@ function fidelitySources(input: {
 /** The repair targets for a set of sources: a section with no text to expand
  *  and one whose text carries neither a declared marker nor an inline literal
  *  alike need no gate, so both are dropped rather than verified against
- *  nothing.  Each target's literals are the declared values its `[[id]]`
+ *  nothing.  Each target's literals are the declared values its `[[lit:<id>]]`
  *  markers reference, followed by the literals its own text supplies when
  *  `extractInline` allows it — which a declared table switches off entirely, so
  *  a planner that names its literals never has undeclared brief prose mined
@@ -459,21 +459,21 @@ function emptyFidelityReport(): FidelityReport {
 
 /**
  * Applies the literal-fidelity gate to a finished expansion.  The deterministic
- * path runs first: every `[[id]]` marker a declared literal owns is replaced
- * with that literal's exact value, so a marker the writer emitted needs no
- * verification at all.  Whatever the table does not declare is then compared
- * against the draft, and the gate asks the writer to re-emit the sections that
- * lost one — at most {@link MAX_FIDELITY_REPAIR_ROUNDS} times — reporting what
- * is still missing.  Each repair response is spliced in place after its own
- * markers are resolved, so every section the gate did not target keeps its exact
- * bytes.  The extra sessions' usage and cost accumulate onto the expansion, so
- * the caller keeps pricing the whole delegation.
+ * path runs first: every `[[lit:<id>]]` marker a declared literal owns is
+ * replaced with that literal's exact value, so a marker the writer emitted
+ * needs no verification at all.  Whatever the table does not declare is then
+ * compared against the draft, and the gate asks the writer to re-emit the
+ * sections that lost one — at most {@link MAX_FIDELITY_REPAIR_ROUNDS} times —
+ * reporting what is still missing.  Each repair response is spliced in place
+ * after its own markers are resolved, so every section the gate did not target
+ * keeps its exact bytes.  The extra sessions' usage and cost accumulate onto
+ * the expansion, so the caller keeps pricing the whole delegation.
  *
  * Every literal gap a repair session can close is repairable, declared ones
- * included: the repair brief prints a declared literal as its `[[<id>]]` marker
- * and the extension substitutes the exact value afterwards, so restoring a
- * marker never asks the writer to retype the value.  A gap is skipped only when
- * the literal already survives elsewhere in the plan.  A target section the
+ * included: the repair brief prints a declared literal as its `[[lit:<id>]]`
+ * marker and the extension substitutes the exact value afterwards, so restoring
+ * a marker never asks the writer to retype the value.  A gap is skipped only
+ * when the literal already survives elsewhere in the plan.  A target section the
  * draft never emitted is reported through `missingSections`, never repaired:
  * inserting a section the caller never asked for would change the plan, and the
  * update path already owns that decision with its unrendered-heading rejection.
@@ -597,8 +597,9 @@ async function enforceLiteralFidelity(
   };
 }
 
-/** Every string an initial blueprint's prose supplies, scanned for `[[id]]`
- *  markers so a declared literal no marker references is rejected. */
+/** Every string an initial blueprint's prose supplies, scanned for
+ *  `[[lit:<id>]]` markers so a declared literal no marker references is
+ *  rejected. */
 function blueprintLiteralTexts(blueprint: PlanBlueprint): string[] {
   const texts: string[] = [blueprint.title, blueprint.context];
   for (const [, path, reason] of blueprint.files) texts.push(path, reason);
@@ -657,7 +658,7 @@ export async function expandBlueprintToMarkdown(
   return enforceLiteralFidelity(pi, ctx, writerModel, planFidelityTargets(blueprint, hydrated), blueprint.literals, expansion);
 }
 
-/** Every string a doc blueprint's outline supplies, scanned for `[[id]]`
+/** Every string a doc blueprint's outline supplies, scanned for `[[lit:<id>]]`
  *  markers.  `path` participates — a marker may stand for the file name — but
  *  it is never sent to the writer as JSON payload metadata. */
 function docLiteralTexts(blueprint: DocBlueprint): string[] {
@@ -826,8 +827,8 @@ export function buildPlanUpdatePromptText(
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-/** Every string a delta's prose supplies, scanned for `[[id]]` markers so a
- *  declared literal no marker references is rejected. */
+/** Every string a delta's prose supplies, scanned for `[[lit:<id>]]` markers so
+ *  a declared literal no marker references is rejected. */
 function deltaLiteralTexts(delta: PlanUpdateBlueprint): string[] {
   const texts: string[] = [];
   if (delta.context !== undefined) texts.push(delta.context);

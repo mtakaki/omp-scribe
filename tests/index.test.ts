@@ -2308,9 +2308,9 @@ Context sentence.
     return {
       slug,
       title: "Fixture Plan",
-      context: "Context sentence referencing [[L1]].",
+      context: "Context sentence referencing [[lit:L1]].",
       files: EXAMPLE_FILES,
-      steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[L1]]`.", [], []]],
+      steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[lit:L1]]`.", [], []]],
       verification: [],
       assumptions: [],
       literals: [["L1", value]],
@@ -2322,11 +2322,11 @@ Context sentence.
 
 ## Context
 
-Context sentence referencing [[L1]].
+Context sentence referencing [[lit:L1]].
 
 ## Approach
 
-- Modify \`src/example.ts\` to use \`[[L1]]\`.
+- Modify \`src/example.ts\` to use \`[[lit:L1]]\`.
 
 ## Critical files & anchors
 
@@ -2420,8 +2420,8 @@ Context sentence referencing [[L1]].
         slug: "literal-undeclared",
         title: "Fixture Plan",
         context: "Context sentence.",
-        files: [["E", "src/example.ts", "example file mentioning [[policyName]]"]],
-        steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[emailsKey]]`.", [], []]],
+        files: [["E", "src/example.ts", "example file mentioning [[lit:policyName]]"]],
+        steps: [["E", "~", [1, 2], "Modify src/example.ts to use `[[lit:emailsKey]]`.", [], []]],
         verification: [],
         assumptions: [],
       },
@@ -2431,15 +2431,52 @@ Context sentence referencing [[L1]].
     expect(result["isError"]).toBe(true);
     const text = (result["content"] as Array<{ text: string }>)[0]!.text;
     expect(text).toContain("no literal declares");
-    expect(text).toContain("[[emailsKey]]");
-    expect(text).toContain("[[policyName]]");
+    expect(text).toContain("[[lit:emailsKey]]");
+    expect(text).toContain("[[lit:policyName]]");
     // Rejected before any file is read, so no writer session and no draft.
     expect(pendingMarkdownStore().get("literal-undeclared")).toBeUndefined();
   });
 
+  it("accepts a blueprint quoting bare double-bracket project syntax", async () => {
+    const { fakeSdk, setScript } = createFakeSdk();
+    setScript(
+      successScript(MARKER_DRAFT.replace(
+        "Context sentence referencing [[lit:L1]].",
+        "Add [[env.staging.analytics_engine_datasets]] and [[routes]], keyed by [[lit:L1]].",
+      )),
+    );
+
+    const fakeApi = createFakeExtensionApi();
+    (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
+    scribe(fakeApi.pi);
+    const { ctx } = planModeContext({ cwd });
+
+    const result = (await fakeApi.callTool(
+      BLUEPRINT_TOOL_NAME,
+      "tcid-literal-toml",
+      {
+        ...makeLiteralBlueprint("literal-toml"),
+        context: "Add the [[env.staging.analytics_engine_datasets]] table header and [[routes]], keyed by [[lit:L1]].",
+      },
+      ctx,
+    )) as Record<string, unknown>;
+
+    // The bare spans are ordinary prose — no undeclared-marker rejection.
+    expect(result["isError"]).toBeUndefined();
+    const text = (result["content"] as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("substituted 2 declared literals from the literal table deterministically");
+
+    const entry = pendingMarkdownStore().get("literal-toml");
+    // The declared markers are substituted and the bare spans survive verbatim.
+    expect(entry?.markdown).toContain("[[env.staging.analytics_engine_datasets]]");
+    expect(entry?.markdown).toContain("[[routes]]");
+    expect(entry?.markdown).toContain("scribe_literal_value");
+    expect(entry?.markdown).not.toContain("[[lit:");
+  });
+
   it("names a marker the draft invented while keeping it in the pending draft", async () => {
     const { fakeSdk, setScript } = createFakeSdk();
-    setScript(successScript(MARKER_DRAFT.replace("to use `[[L1]]`", "to use `[[L1]]` past `[[L9]]`")));
+    setScript(successScript(MARKER_DRAFT.replace("to use `[[lit:L1]]`", "to use `[[lit:L1]]` past `[[lit:L9]]`")));
 
     const fakeApi = createFakeExtensionApi();
     (fakeApi.pi as unknown as Record<string, unknown>)["pi"] = fakeSdk;
@@ -2459,13 +2496,13 @@ Context sentence referencing [[L1]].
     expect(text).toContain("verified verbatim");
     expect(text).toContain("substituted 2 declared literals from the literal table deterministically");
     expect(text).toContain("could not resolve 1 marker");
-    expect(text).toContain("[[L9]]");
+    expect(text).toContain("[[lit:L9]]");
     const details = result["details"] as { literalMetrics?: { resolved: number; unresolved: string[] } };
     expect(details.literalMetrics?.resolved).toBe(2);
     expect(details.literalMetrics?.unresolved).toEqual(["L9"]);
     // Reporting only: the marker the planner still has to declare is what the
     // write swap would finalize.
-    expect(pendingMarkdownStore().get("literal-invented")?.markdown).toContain("[[L9]]");
+    expect(pendingMarkdownStore().get("literal-invented")?.markdown).toContain("[[lit:L9]]");
   });
 
   it("rejects a doc bullet naming a marker no literal declares", async () => {
@@ -2480,7 +2517,7 @@ Context sentence referencing [[L1]].
         slug: "doc-undeclared",
         title: "Doc",
         path: "DOC.md",
-        sections: [{ heading: "Overview", bullets: ["Run the check with [[emailsKey]]."] }],
+        sections: [{ heading: "Overview", bullets: ["Run the check with [[lit:emailsKey]]."] }],
       },
       ctx,
     )) as Record<string, unknown>;

@@ -92,12 +92,13 @@ export function tupleJson(plan: PlanBlueprint): string {
   return JSON.stringify(plan);
 }
 
-/** Replaces every `[[id]]` marker with the literal value it stands for, so a
- *  rendering can carry the same content the tuple IR does without repeating the
- *  declaration table. */
+/** Replaces every `[[lit:<id>]]` marker with the literal value it stands for, so
+ *  a rendering can carry the same content the tuple IR does without repeating
+ *  the declaration table.  A span without the `lit:` sentinel is not a marker
+ *  and passes through untouched. */
 function expandMarkers(text: string, literals: readonly ScribeLiteral[] | undefined): string {
   const values = new Map((literals ?? []).map(([id, value]) => [id.toLowerCase(), value] as const));
-  return text.replace(/\[\[([^\]]+)\]\]/g, (_match, id: string) => values.get(id.trim().toLowerCase()) ?? `[[${id}]]`);
+  return text.replace(/\[\[lit:([^\[\]\n]+)\]\]/g, (match, id: string) => values.get(id.trim().toLowerCase()) ?? match);
 }
 
 const OPERATION_LABELS: Record<string, string> = { "+": "add", "!": "delete", "~": "modify" };

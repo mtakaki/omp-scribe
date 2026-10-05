@@ -80,14 +80,14 @@ const REPAIRED_VERIFICATION = `## Verification
 `;
 
 /** A blueprint that declares three literals and references each once by its
- *  `[[id]]` marker, so a marker-emitting draft resolves all three
+ *  `[[lit:<id>]]` marker, so a marker-emitting draft resolves all three
  *  deterministically and needs no repair session. */
 const DECLARED_BLUEPRINT: PlanBlueprint = {
   slug: "declared-plan",
   title: "Declared Plan",
   context: "The search API changed how it rejects malformed requests.",
   files: [["D", "src/search.ts", "the search route"]],
-  steps: [["D", "~", [1, 2], "Return `[[L1]]` and reject with `[[L2]]` when `[[L3]]` is absent.", [], []]],
+  steps: [["D", "~", [1, 2], "Return `[[lit:L1]]` and reject with `[[lit:L2]]` when `[[lit:L3]]` is absent.", [], []]],
   verification: [],
   assumptions: [],
   literals: [
@@ -107,7 +107,7 @@ The search API changed how it rejects malformed requests.
 
 ## Approach
 
-- Modify \`src/search.ts\` lines 1-2 to return \`[[L1]]\` and reject with \`[[L2]]\` when \`[[L3]]\` is absent.
+- Modify \`src/search.ts\` lines 1-2 to return \`[[lit:L1]]\` and reject with \`[[lit:L2]]\` when \`[[lit:L3]]\` is absent.
 
 ## Critical files & anchors
 
@@ -119,7 +119,7 @@ The search API changed how it rejects malformed requests.
 const CONTEXT_MARKER_BLUEPRINT: PlanBlueprint = {
   ...DECLARED_BLUEPRINT,
   slug: "context-marker-plan",
-  context: "The search API now refuses malformed requests with the `[[L3]]` error.",
+  context: "The search API now refuses malformed requests with the `[[lit:L3]]` error.",
 };
 
 /** {@link DECLARED_BLUEPRINT} whose Context sentence names a path no table
@@ -135,29 +135,29 @@ const UNDECLARED_CONTEXT_BLUEPRINT: PlanBlueprint = {
  *  marker kept, which must pass the gate without a repair session. */
 const REPHRASED_CONTEXT_DRAFT = DECLARED_DRAFT.replace(
   "The search API changed how it rejects malformed requests.",
-  "Malformed search requests are now refused with the `[[L3]]` error.",
+  "Malformed search requests are now refused with the `[[lit:L3]]` error.",
 );
 
 /** {@link DECLARED_DRAFT} with one declared marker replaced by a paraphrase of
  *  its value: the extension knows the exact value, so it reports the gap
  *  instead of spending a repair session. */
-const PARAPHRASED_DRAFT = DECLARED_DRAFT.replace("reject with `[[L2]]`", "reject with `relation-not-permitted`");
+const PARAPHRASED_DRAFT = DECLARED_DRAFT.replace("reject with `[[lit:L2]]`", "reject with `relation-not-permitted`");
 
 /** {@link DECLARED_DRAFT} with one declared marker omitted outright. */
-const OMITTED_DRAFT = DECLARED_DRAFT.replace(" and reject with `[[L2]]`", "");
+const OMITTED_DRAFT = DECLARED_DRAFT.replace(" and reject with `[[lit:L2]]`", "");
 
 /** {@link DECLARED_DRAFT} emitting one declared marker twice. */
-const DUPLICATE_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` from `[[L1]]`");
+const DUPLICATE_DRAFT = DECLARED_DRAFT.replace("to return `[[lit:L1]]`", "to return `[[lit:L1]]` from `[[lit:L1]]`");
 
 /** {@link DECLARED_DRAFT} plus a marker no table entry declares: the gate
  *  reports it as unresolved rather than stripping it from the plan. */
-const INVENTED_MARKER_DRAFT = DECLARED_DRAFT.replace("to return `[[L1]]`", "to return `[[L1]]` past `[[L9]]`");
+const INVENTED_MARKER_DRAFT = DECLARED_DRAFT.replace("to return `[[lit:L1]]`", "to return `[[lit:L1]]` past `[[lit:L9]]`");
 
-/** The repair response for a draft that dropped `[[L2]]`: it re-emits the
+/** The repair response for a draft that dropped `[[lit:L2]]`: it re-emits the
  *  declared marker, which the extension substitutes with the exact value. */
 const DECLARED_REPAIR = `## Approach
 
-- Modify \`src/search.ts\` lines 1-2 to return \`[[L1]]\` and reject with \`[[L2]]\` when \`[[L3]]\` is absent.
+- Modify \`src/search.ts\` lines 1-2 to return \`[[lit:L1]]\` and reject with \`[[lit:L2]]\` when \`[[lit:L3]]\` is absent.
 `;
 
 function successScript(text: string): FakeSessionEvent[] {
@@ -800,7 +800,7 @@ describe("literal fidelity", () => {
     expect(result.literalMetrics.unresolved).toEqual(["L9"]);
     expect(result.literalMetrics.resolved).toBe(3);
     // The gate reports the marker; it never rewrites the draft.
-    expect(result.markdown).toContain("[[L9]]");
+    expect(result.markdown).toContain("[[lit:L9]]");
     // Every declared literal survives, so the gate spent no repair round.
     expect(result.fidelity?.missing).toEqual([]);
     expect(sessionCount()).toBe(1);
@@ -817,7 +817,7 @@ describe("literal fidelity", () => {
     const result = await expandBlueprintToMarkdown(pi, ctx, "@smol", DECLARED_BLUEPRINT);
     if (!("markdown" in result)) throw new Error("Expected markdown");
 
-    // The repair brief hands the writer the `[[L2]]` marker and the extension
+    // The repair brief hands the writer the `[[lit:L2]]` marker and the extension
     // substitutes the exact declared value afterwards.
     expect(result.fidelity?.missing).toEqual([]);
     expect(result.fidelity?.repaired).toBe(true);
@@ -956,7 +956,7 @@ describe("expandDocBlueprintToMarkdown", () => {
 
   it("resolves a declared marker in a doc blueprint bullet without a repair session", async () => {
     const { fakeSdk, setScript, sessionCount } = createFakeSdk();
-    setScript(successScript("# Test README\n\n## Usage\n\nRun [[L1]] to bring the stack up."));
+    setScript(successScript("# Test README\n\n## Usage\n\nRun [[lit:L1]] to bring the stack up."));
 
     const pi = makeApiWithSdk(fakeSdk);
     const { ctx } = createFakeExtensionContext({ hasUI: false });
@@ -965,7 +965,7 @@ describe("expandDocBlueprintToMarkdown", () => {
       slug: "marked-readme",
       title: "Test README",
       path: "README.md",
-      sections: [{ heading: "Usage", bullets: ["Run [[L1]]."] }],
+      sections: [{ heading: "Usage", bullets: ["Run [[lit:L1]]."] }],
       literals: [["L1", "bun start"]],
     };
 

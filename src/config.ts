@@ -336,7 +336,7 @@ export interface PendingBlueprint {
    *  have had to emit; absent for full-document drafts, which fall back to
    *  measuring `markdown`. */
   deltaDocOutputTokens?: number;
-  /** The deterministic `[[id]]` marker substitutions and the repair-session
+  /** The deterministic `[[lit:<id>]]` marker substitutions and the repair-session
    *  spend this draft accrued.  The repair tokens are a subset of
    *  `writerUsage`, already reflected in `writerCostUsd`, so they carry as a
    *  breakdown rather than a second cost. */

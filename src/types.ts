@@ -12,9 +12,9 @@ export type ScribeOperation = "+" | "!" | "~";
 export type ScribeFile = readonly [id: string, path: string, reason: string];
 
 /** [id, value] — one load-bearing literal the plan preserves verbatim.  The
- *  planner writes the `[[id]]` marker where the value belongs; the writer emits
- *  the marker and the extension substitutes `value`, so the writer never types
- *  the value itself. */
+ *  planner writes the `[[lit:<id>]]` marker where the value belongs; the writer
+ *  emits the marker and the extension substitutes `value`, so the writer never
+ *  types the value itself. */
 export type ScribeLiteral = readonly [id: string, value: string];
 
 /** [start, end] — an inclusive 1-based line range. */
@@ -49,8 +49,8 @@ export interface PlanBlueprint {
   steps: readonly ScribeStep[];
   verification: readonly string[];
   assumptions: readonly string[];
-  /** Load-bearing literals the writer references as `[[id]]` markers and the
-   *  extension substitutes with the exact `value`. */
+  /** Load-bearing literals the writer references as `[[lit:<id>]]` markers and
+   *  the extension substitutes with the exact `value`. */
   literals?: readonly ScribeLiteral[];
 }
 
@@ -78,7 +78,7 @@ export interface PlanUpdateBlueprint {
   assumptions?: readonly string[];
   /** Headings of sections to delete from the plan document. */
   drop?: readonly string[];
-  /** Load-bearing literals this delta's sections reference as `[[id]]` markers. */
+  /** Load-bearing literals this delta's sections reference as `[[lit:<id>]]` markers. */
   literals?: readonly ScribeLiteral[];
 }
 
@@ -99,6 +99,6 @@ export interface DocBlueprint {
   /** Exact write target declared up front, e.g. "README.md" or "docs/ARCHITECTURE.md". */
   path: string;
   sections: DocBlueprintSection[];
-  /** Load-bearing literals the document references as `[[id]]` markers. */
+  /** Load-bearing literals the document references as `[[lit:<id>]]` markers. */
   literals?: readonly ScribeLiteral[];
 }

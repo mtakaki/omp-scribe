@@ -59,15 +59,17 @@ const WRITER_PROMPT_BUDGETS: ReadonlyArray<{ label: string; text: () => string; 
   { label: "DOC_WRITER_SYSTEM_PROMPT", text: () => DOC_WRITER_SYSTEM_PROMPT, ceiling: 167, before: 223 },
 ];
 
-/** The directive's ceiling: the newly measured 627 tokens +10% rounded up to
- *  the next multiple of 5. The 700-token contract still holds, with margin. */
+/** The directive's ceiling: the 627-token measurement it was recorded from
+ *  +10% rounded up to the next multiple of 5.  The sentinel marker spelling and
+ *  the bounded-retry rule moved it to 648, so the 700-token contract still
+ *  holds, with margin. */
 const DIRECTIVE_CEILING = 690;
 
 /** Instructions the plan-mode directive must still carry after compression. */
 const DIRECTIVE_KEYWORDS: readonly string[] = [
   "propose_plan_blueprint",
   "propose_plan_update",
-  "[[<id>]]",
+  "[[lit:<id>]]",
   "pending",
   "xd://propose",
   "local://",
@@ -75,6 +77,7 @@ const DIRECTIVE_KEYWORDS: readonly string[] = [
   "write the plan Markdown yourself",
   "regenerates that section from scratch",
   "1-32",
+  "call that tool once more",
 ];
 
 /** Every tuple position, bound, and operation char each tool schema must spell
@@ -175,7 +178,7 @@ describe("writer system prompt budget", () => {
 
   tokenIt("keeps the marker-emission rules in all three writer prompts", () => {
     for (const prompt of [WRITER_SYSTEM_PROMPT, PLAN_UPDATE_WRITER_SYSTEM_PROMPT, DOC_WRITER_SYSTEM_PROMPT]) {
-      expect(prompt).toContain("[[<id>]]");
+      expect(prompt).toContain("[[lit:<id>]]");
       expect(prompt).toMatch(/marker.*verbatim|verbatim.*marker/s);
     }
   });
