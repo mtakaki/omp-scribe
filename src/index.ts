@@ -1,9 +1,11 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ToolCallEvent, WriteToolInput } from "@oh-my-pi/pi-coding-agent";
 import type { Model } from "@oh-my-pi/pi-catalog";
+import { readFile } from "node:fs/promises";
 import {
   BLUEPRINT_TOOL_NAME,
   DEFAULT_WRITER_MODEL,
   DOC_BLUEPRINT_TOOL_NAME,
+  PLAN_UPDATE_TOOL_NAME,
   SCRIBE_MODEL_CONFIG_RELATIVE_PATH,
   isPlanModeActive,
   consumedWriteSwaps,
@@ -18,6 +20,7 @@ import {
   PLACEHOLDER_CONTENT,
   readScribeConfig,
   registerScribeFlags,
+  resolveLocalArtifactPath,
   resolveWriterModel,
   sameModel,
   scribeModelConfigPath,
@@ -25,35 +28,37 @@ import {
   type ScribeConfig,
   type ScribeStatusState,
 } from "./config";
-import type { DocBlueprint, PlanBlueprint } from "./types";
-import { expandBlueprintToMarkdown, expandDocBlueprintToMarkdown } from "./writer-session";
+import type { DocBlueprint, PlanBlueprint, PlanUpdateBlueprint } from "./types";
+import { planHeadingKey, splicePlanSections, splitPlanSections, type PlanSection } from "./plan-sections";
+import {
+  deltaSupplies,
+  expandBlueprintToMarkdown,
+  expandDocBlueprintToMarkdown,
+  expandPlanUpdateToMarkdown,
+  planUpdateDrops,
+  planUpdateHeadings,
+  planUpdateRemovals,
+} from "./writer-session";
+import { formatLiteralMarker, type FidelityReport, type LiteralRunMetrics } from "./literal-fidelity";
 import { computeCosts } from "./pricing";
 import {
   appendBlueprintFailure,
   appendSavingsRun,
   estimateBlueprintTokens,
+  estimateTextTokens,
   formatSavingsDashboard,
   readStatsFile,
   type SavingsRunLogEntry,
 } from "./stats-store";
 
 const SCRIBE_DIRECTIVE = `<scribe>
-Cost control is active for this plan turn. Do NOT compose the Markdown plan document yourself.
-1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown) covering slug/title/context/verification/assumptions, plus \`files\` and \`steps\` arrays:
-   files entries are [id, path, reason] — id is a short label (e.g. "A"), path is project-relative, reason is one line on why the file matters.
-   steps entries are [fileId, operation, range, intent, preserve, doNot]:
-   - \`fileId\` — must match an id in \`files\`.
-   - \`operation\` — "+" add, "!" delete, "~" modify.
-   - \`range\` — [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file).
-   - \`intent\` — a concise natural-language sentence describing the change; never an abbreviation or code.
-   - \`preserve\` — array of things that must keep working; empty array when none.
-   - \`doNot\` — array of explicit prohibitions; empty array when none.
-   - Exactly six elements per step — no extra notes, rationale, or constraints slots.
-   Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
-   Example: files: [["A","src/auth.ts","password validation and cookie handling"]], steps: [["A","~",[42,67],"Validate the configured production password and issue the existing cookie.",["preserve the existing cookie format"],["do not modify admin authentication"]]].
-2. After it returns, call \`write\` with path \`local://<slug>-plan.md\` (the same slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown automatically before the write executes. Use \`write\` even when the plan file already exists: the draft is a complete replacement, so never edit it in place.
-3. Then continue the normal \`xd://propose\` submission with that slug, as usual.
-Never draft the Markdown plan body yourself, at any point in this turn. If \`${BLUEPRINT_TOOL_NAME}\` reports a failure, write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
+Cost control is active for this plan turn: never compose the Markdown plan document yourself.
+1. Call \`${BLUEPRINT_TOOL_NAME}\` exactly once with a compact JSON object (no prose, no Markdown). Its parameters are documented on the tool: slug, title, context, verification, assumptions, literals, files, steps. Declare each exact string the plan must preserve character-for-character once in literals — [id, value] pairs, id 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case, value the exact text of at most 8000 characters. Where a declared value belongs, write the marker [[lit:<id>]] — never the value itself — inside context, a file reason, a step intent/preserve/doNot, verification, or assumptions, and reference every declared id at least once; the extension substitutes the exact value after the writer's response, so the writer never types it. Never paste file content or line bodies into a step: the extension reads the referenced range from disk for the writer model.
+2. Then call \`write\` with path \`local://<slug>-plan.md\` (the slug you supplied) and content exactly the single word \`${PLACEHOLDER_CONTENT}\` — the extension substitutes the expanded Markdown before the write executes. Use \`write\` even when the plan file already exists: the draft replaces it completely, so never edit in place.
+3. The tool result reports literal fidelity — "verified verbatim", or the exact literals the draft lost — as machine-checked evidence: do NOT re-read the plan file and do NOT re-check it against your blueprint. If literals are still listed missing after the repair pass, record the gap with \`${PLAN_UPDATE_TOOL_NAME}\` instead of reading the file back.
+4. To record a refinement once the plan file exists, do NOT rewrite the plan and do NOT call \`${BLUEPRINT_TOOL_NAME}\` again: call \`${PLAN_UPDATE_TOOL_NAME}\` with the same slug and ONLY the fields that changed — literals (declare any new exact string and reference it by its [[lit:<id>]] marker), context, files (with steps, since every step references a file id), verification, assumptions — plus optional drop, the headings to delete (naming a heading in both drop and the field that supplies it regenerates that section from scratch). Then call \`write\` again with path \`local://<slug>-plan.md\` and content exactly \`${PLACEHOLDER_CONTENT}\`; the extension rewrites just those sections and splices them in, leaving every section you did not name byte-identical.
+5. Then continue the normal \`xd://propose\` submission with that slug.
+Never draft the Markdown plan body yourself, at any point in this turn, for either the first draft or a refinement. If \`${BLUEPRINT_TOOL_NAME}\` or \`${PLAN_UPDATE_TOOL_NAME}\` reports a failure, fix exactly the problem it names and call that tool once more; only a second failure means write the plan Markdown yourself with \`write\` and continue — never the placeholder word.
 </scribe>`;
 
 const DOC_SCRIBE_DIRECTIVE = `<scribe-doc>
@@ -63,21 +68,124 @@ Doc-blueprint mode is active for this document. Do NOT compose the full Markdown
 Never draft the Markdown document body yourself, at any point in this turn. If \`${DOC_BLUEPRINT_TOOL_NAME}\` reports a failure, write the document yourself with \`write\` and continue — never the placeholder word.
 </scribe-doc>`;
 
+/** Missing literals the fidelity line names before summarizing the tail: the
+ *  brain needs enough to see what the writer dropped, not a transcript. */
+const MAX_REPORTED_MISSING_LITERALS = 8;
+
+/**
+ * The literal-fidelity sentence appended to a tool result: what the gate
+ * verified, how many declared literals it substituted deterministically, which
+ * markers the draft carries that no declared literal owns, or which literals
+ * the draft lost and how to record the gap.
+ *
+ * Returns "" when the path produced no report (the tool did not run the gate)
+ * or when there is nothing at all to report — no literal to check, none
+ * missing, no section omitted, no unresolved marker — so callers can append the
+ * result unconditionally.  Each missing literal is named once, and the sentence
+ * tells the brain not to re-read the plan file — that re-read plus the
+ * `propose_plan_update` it triggers is the cost the gate exists to remove.
+ */
+function formatFidelityLine(fidelity: FidelityReport | undefined, metrics: LiteralRunMetrics | undefined): string {
+  if (fidelity === undefined) return "";
+
+  const missing = [...new Set(fidelity.missing)];
+  const unresolved = metrics === undefined ? [] : [...new Set(metrics.unresolved)];
+  if (fidelity.checked === 0 && missing.length === 0 && fidelity.missingSections.length === 0 && unresolved.length === 0) return "";
+
+  const parts: string[] = [];
+  if (missing.length > 0) {
+    const shown = missing.slice(0, MAX_REPORTED_MISSING_LITERALS).map(literal => `\`${literal}\``).join(", ");
+    const more = missing.length - MAX_REPORTED_MISSING_LITERALS;
+    parts.push(
+      `Literal fidelity: the repair pass could not restore ${missing.length} load-bearing literal${missing.length === 1 ? "" : "s"}: ${shown}${more > 0 ? ` and ${more} more` : ""}. Do not re-read the plan file to verify them; record the gap with ${PLAN_UPDATE_TOOL_NAME} before proposing.`,
+    );
+  } else if (fidelity.checked > 0) {
+    const verified = fidelity.checked === 1 ? "is" : "are";
+    parts.push(
+      `Literal fidelity: all ${fidelity.checked} load-bearing literal${fidelity.checked === 1 ? "" : "s"} the brief supplies ${verified} verified verbatim in the draft.`,
+    );
+  }
+  if (fidelity.missingSections.length > 0) {
+    parts.push(`The draft has no ${fidelity.missingSections.join(", ")} section, so the literals it supplies were not checked.`);
+  }
+  if (metrics !== undefined && metrics.resolved > 0) {
+    parts.push(
+      `Scribe substituted ${metrics.resolved} declared literal${metrics.resolved === 1 ? "" : "s"} from the literal table deterministically.`,
+    );
+  }
+  if (unresolved.length > 0) {
+    const shown = unresolved.slice(0, MAX_REPORTED_MISSING_LITERALS).map(id => formatLiteralMarker(id)).join(", ");
+    const more = unresolved.length - MAX_REPORTED_MISSING_LITERALS;
+    parts.push(
+      `Scribe could not resolve ${unresolved.length} marker${unresolved.length === 1 ? "" : "s"} the draft carries: ${shown}${more > 0 ? ` and ${more} more` : ""}; declare each id in the literals table with the exact value it stands for, or re-record the section that carries it with ${PLAN_UPDATE_TOOL_NAME}.`,
+    );
+  }
+  return parts.join(" ");
+}
+
 /** Footer status key holding the Scribe line; cleared on session shutdown. */
 const STATUS_KEY = "scribe";
 
-/** Wire-input shape of the plan blueprint tool. `verification`/`assumptions` are
- *  optional so a model that omits one — models drop trailing keys when a tool
+/** Wire-input shape of the plan blueprint tool. `verification`/`assumptions`/`literals`
+ *  are optional so a model that omits one — models drop trailing keys when a tool
  *  call is large — still executes; `execute` fills the empty defaults in before
  *  handing the blueprint to the writer model. `files`/`steps` are required
  *  (both schema-enforced `min(1)` arrays). */
-type PlanBlueprintInput = Omit<PlanBlueprint, "verification" | "assumptions"> &
-  Partial<Pick<PlanBlueprint, "verification" | "assumptions">>;
+type PlanBlueprintInput = Omit<PlanBlueprint, "verification" | "assumptions" | "literals"> &
+  Partial<Pick<PlanBlueprint, "verification" | "assumptions" | "literals">>;
+
+/** Tools whose calls are scribe traffic: the brain's usage is accumulated while
+ *  any of them is active, and a failed call is recorded as a blueprint failure. */
+const SCRIBE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDATE_TOOL_NAME, DOC_BLUEPRINT_TOOL_NAME];
+
+/** Tools that exist only on plan-mode turns, activated and deactivated together. */
+const PLAN_MODE_TOOL_NAMES: readonly string[] = [BLUEPRINT_TOOL_NAME, PLAN_UPDATE_TOOL_NAME];
+
+/** Appended to both plan tools' `steps` description.  The literal-fidelity gate
+ *  can only verify literals a step names, and the writer can only reproduce
+ *  what it is handed verbatim, so a literal left implicit in the intent's prose
+ *  may legitimately be paraphrased away.  A marker no declared literal owns can
+ *  never be substituted, so it would ship as literal `[[lit:<id>]]` text — hence
+ *  the declaration rule. */
+const STEP_LITERAL_REQUIREMENT =
+  "Declare every load-bearing literal this step relies on in literals and write its [[lit:<id>]] marker in intent, preserve, or doNot: the writer copies markers verbatim, and a marker no declared literal owns is rejected.";
+
+/** `literals` parameter description shared by all three blueprint tools, so the
+ *  declaration grammar can never drift between them. */
+const LITERALS_PARAM_DESCRIPTION =
+  "Load-bearing literals: 2-element [id, value] tuples (id: 1-32 characters matching [A-Za-z][A-Za-z0-9_-]*, unique ignoring case; value: the exact string to keep verbatim, max 8000 chars). Write each value's [[lit:<id>]] marker where the value belongs, and reference every declared id; the extension substitutes it.";
+
+/** Writer identity recorded for a draft the extension produces itself: a
+ *  drop-only plan update deletes sections and regenerates none, so no writer
+ *  session runs and the run spends no writer tokens. */
+const NO_WRITER_MODEL = { provider: "scribe", id: "splice" } as const;
+
+/** Reads the plan Markdown for `slug` out of this session's `local://` root,
+ *  trying the canonical `<slug>-plan.md` artifact and then the host's default
+ *  `PLAN.md`.  Returns the text, or the reason an update cannot proceed. */
+async function readPlanArtifact(ctx: ExtensionContext, slug: string): Promise<{ text: string } | { error: string }> {
+  const candidates = [`local://${slug}-plan.md`, "local://PLAN.md"];
+  for (const candidate of candidates) {
+    const path = await resolveLocalArtifactPath(ctx, candidate);
+    if (path === undefined) continue;
+    let text: string;
+    try {
+      text = await readFile(path, "utf8");
+    } catch (error) {
+      return { error: `${candidate} could not be read (${error instanceof Error ? error.message : String(error)})` };
+    }
+    if (text.trim() === "") return { error: `${candidate} is empty, so there is nothing to revise` };
+    return { text };
+  }
+  return {
+    error: `no plan file exists for slug "${slug}" (tried ${candidates.join(" and ")} under this session's local:// root)`,
+  };
+}
 
 export default function scribe(pi: ExtensionAPI): void {
   registerScribeFlags(pi);
 
-  let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL };
+  let cfg: ScribeConfig = { brainModel: undefined, writerModel: DEFAULT_WRITER_MODEL, tokenReport: false };
   let lastKnownModels: Model[] = [];
   let brainUsage = { input: 0, output: 0 };
   let brainModelId: string | undefined;
@@ -140,7 +248,7 @@ export default function scribe(pi: ExtensionAPI): void {
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     const active = pi.getActiveTools();
-    if (!active.includes(BLUEPRINT_TOOL_NAME) && !active.includes(DOC_BLUEPRINT_TOOL_NAME)) return;
+    if (!SCRIBE_TOOL_NAMES.some(name => active.includes(name))) return;
     brainUsage = { input: brainUsage.input + event.message.usage.input, output: brainUsage.output + event.message.usage.output };
     brainCostUsd += event.message.usage.cost?.total ?? 0;
     brainModelId = `${event.message.provider}/${event.message.model}`;
@@ -154,34 +262,40 @@ export default function scribe(pi: ExtensionAPI): void {
     name: BLUEPRINT_TOOL_NAME,
     label: "Propose Plan Blueprint",
     description:
-      `Plan mode only. Submit a compact JSON architecture blueprint instead of composing the full Markdown plan yourself: plain metadata fields plus a \`files\` table ([id, path, reason]) and a \`steps\` array ([fileId, operation, range|null, intent, preserve[], doNot[]]). A separate lightweight model expands it — with each referenced line range hydrated from disk — into the final \`local://<slug>-plan.md\` document. Call this exactly once per plan.`,
+      `Plan mode only. Submit a compact JSON blueprint instead of composing the plan Markdown; a lightweight model expands it, hydrating each referenced line range from disk, into \`local://<slug>-plan.md\`.`,
     parameters: z.object({
       slug: z
         .string()
         .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
-        .describe("Plan slug; the final file is local://<slug>-plan.md"),
+        .describe("Plan slug; the file is local://<slug>-plan.md"),
       title: z.string().describe("Short plan title"),
-      context: z.string().describe("2-4 sentences: literal ask, need, intended end state"),
+      context: z.string().describe("2-4 sentences: the ask, need, and end state"),
+      literals: z
+        .array(z.array(z.unknown()).min(2).max(2))
+        .optional()
+        .describe(
+          LITERALS_PARAM_DESCRIPTION,
+        ),
       files: z
         .array(z.array(z.unknown()).min(3).max(3))
         .min(1)
         .describe(
-          "Files the plan touches, each a 3-element [id, path, reason] array: id is a short label steps reference by; path is project-relative; reason is one line on why the file matters. Exact shape enforced when the blueprint tool runs.",
+          "Touched files: 3-element [id, path, reason] tuples. id is a short label steps reference, path is project-relative, reason is one line on why the file matters.",
         ),
       steps: z
         .array(z.array(z.unknown()).min(6).max(6))
         .min(1)
         .describe(
-          `Ordered load-bearing change steps, each a 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] array. operation: "+" add, "!" delete, "~" modify. range is [startLine, endLine] inclusive 1-based, or null when no existing range applies (e.g. a new file). intent is a concise natural-language sentence, never an abbreviation. preserve/doNot list only constraints the writer must not lose; empty arrays are valid. Exactly six elements — no extra notes, rationale, or constraints slots. Exact shape enforced when the blueprint tool runs.`,
+          `Ordered load-bearing change steps: 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] tuples. operation: "+" add, "!" delete, "~" modify; range [startLine, endLine] 1-based inclusive or null; preserve/doNot are constraint lists, possibly empty. ${STEP_LITERAL_REQUIREMENT}`,
         ),
       verification: z
         .array(z.string())
         .optional()
-        .describe("Concrete input -> expected observable output checks, exact commands"),
+        .describe("Concrete input -> expected output checks"),
       assumptions: z
         .array(z.string())
         .optional()
-        .describe("User-overridable decisions with a pre-decided fallback; omit when none"),
+        .describe("User-overridable decisions, each with a fallback; omit when none"),
     }),
     approval: "read",
     strict: true,
@@ -193,6 +307,7 @@ export default function scribe(pi: ExtensionAPI): void {
         slug: raw.slug,
         title: raw.title,
         context: raw.context,
+        literals: raw.literals ?? [],
         files: raw.files,
         steps: raw.steps,
         verification: raw.verification ?? [],
@@ -219,21 +334,265 @@ export default function scribe(pi: ExtensionAPI): void {
         writerUsage: result.usage,
         writerCostUsd: result.costUsd,
         irOutputTokens: estimateBlueprintTokens(params),
+        literalMetrics: result.literalMetrics,
+        tokenAccounting: result.tokenAccounting,
       });
+
+      // The diagnostic only ever reads the accounting: the flag decides whether
+      // it reaches the log, never whether the draft is accepted.
+      if (cfg.tokenReport && result.tokenAccounting) {
+        const { system, brief, snippet, total, encoding, exact } = result.tokenAccounting;
+        pi.logger.info(
+          `[scribe-extension] writer input ${total} tokens (system ${system}, brief ${brief}, snippet ${snippet}) in ${encoding ?? "estimate"}${exact ? "" : " (approximate: no native tokenizer)"}`,
+        );
+      }
 
       showStatus(ctx, {
         kind: "plan",
         draft: { model: `${result.model.provider}/${result.model.id}`, chars: result.markdown.length },
       });
 
+      const fidelityLine = formatFidelityLine(result.fidelity, result.literalMetrics);
       return {
         content: [
           {
             type: "text",
-            text: `Blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "local://${blueprint.slug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${blueprint.slug}".`,
+            text: [
+              `Blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "local://${blueprint.slug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${blueprint.slug}".`,
+              fidelityLine,
+            ]
+              .filter(part => part !== "")
+              .join(" "),
           },
         ],
-        details: { slug: blueprint.slug, markdownChars: result.markdown.length, writerModel: `${result.model.provider}/${result.model.id}` },
+        details: {
+          slug: blueprint.slug,
+          markdownChars: result.markdown.length,
+          writerModel: `${result.model.provider}/${result.model.id}`,
+          fidelity: result.fidelity,
+          literalMetrics: result.literalMetrics,
+          tokenAccounting: result.tokenAccounting,
+        },
+      };
+    },
+  });
+
+  // ─── propose_plan_update tool ─────────────────────────────────────────────
+  pi.registerTool({
+    name: PLAN_UPDATE_TOOL_NAME,
+    label: "Propose Plan Update",
+    description:
+      `Plan mode only, once a plan file exists. Revise it without rewriting: submit only the changed fields plus optional \`drop\` headings, and a lightweight model rewrites just those sections and splices them into \`local://<slug>-plan.md\`.`,
+    parameters: z.object({
+      slug: z
+        .string()
+        .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
+        .describe("Slug of the plan being revised; the file is local://<slug>-plan.md"),
+      literals: z
+        .array(z.array(z.unknown()).min(2).max(2))
+        .optional()
+        .describe(
+          LITERALS_PARAM_DESCRIPTION,
+        ),
+      context: z
+        .string()
+        .optional()
+        .describe("Change to fold into Context; omit to leave it untouched"),
+      files: z
+        .array(z.array(z.unknown()).min(3).max(3))
+        .optional()
+        .describe(
+          "Files to add to Critical files & anchors: 3-element [id, path, reason] tuples; send with steps, which reference them.",
+        ),
+      steps: z
+        .array(z.array(z.unknown()).min(6).max(6))
+        .optional()
+        .describe(
+          `Change steps to fold into Approach: 6-element [fileId, operation, range|null, intent, preserve[], doNot[]] tuples; requires files in the same call. ${STEP_LITERAL_REQUIREMENT}`,
+        ),
+      verification: z
+        .array(z.string())
+        .optional()
+        .describe("Bullets to add to Verification"),
+      assumptions: z
+        .array(z.string())
+        .optional()
+        .describe("Decisions to add to Assumptions"),
+      drop: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Plan section headings to delete, e.g. \"Assumptions & contingencies\". A heading this call also supplies through another field is regenerated from scratch rather than deleted.",
+        ),
+    }),
+    approval: "read",
+    strict: true,
+    loadMode: "essential",
+    defaultInactive: true,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const delta = params as PlanUpdateBlueprint;
+      const headings = planUpdateHeadings(delta);
+      const drops = planUpdateDrops(delta);
+      /** A heading the delta also supplies is regenerated, not removed, so it
+       *  is spliced by the replacement path and never counted as dropped. */
+      const removals = planUpdateRemovals(delta);
+      if (headings.length === 0 && drops.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Plan update carried no changes: supply at least one of context, files + steps, verification, assumptions, or drop.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (deltaSupplies(delta, "steps") && !deltaSupplies(delta, "files")) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Plan update supplied steps without files: every step references a file id, so send files and steps together.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const store = pendingMarkdownStore();
+      const key = sessionKey(ctx);
+      /** A draft still awaiting its write is the freshest plan text, so a second
+       *  update in the same turn builds on it rather than on the older file. */
+      const target = planFileTarget(`local://${delta.slug}-plan.md`);
+      const pending = target === undefined ? undefined : pendingPlanEntry(store, key, target);
+      const writeSlug = pending?.key ?? delta.slug;
+
+      let currentText = pending?.entry.markdown;
+      if (currentText === undefined) {
+        const located = await readPlanArtifact(ctx, writeSlug);
+        if ("error" in located) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Plan update cannot proceed: ${located.error}. Call ${BLUEPRINT_TOOL_NAME} first to draft the plan body, then continue with xd://propose.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        currentText = located.text;
+      }
+
+      /** A drop rewrites no prose, so it needs no writer session: splice it out
+       *  and hand the result to the normal write swap. */
+      if (headings.length === 0) {
+        const spliced = splicePlanSections(currentText, [], removals);
+        store.set(writeSlug, {
+          sessionKey: key,
+          markdown: spliced,
+          writerModel: NO_WRITER_MODEL,
+          writerUsage: { input: 0, output: 0 },
+          writerCostUsd: 0,
+          irOutputTokens: estimateBlueprintTokens(params),
+          deltaDocOutputTokens: 0,
+          literalMetrics: { resolved: 0, unresolved: [], repairRounds: 0, repairInputTokens: 0, repairOutputTokens: 0 },
+        });
+        showStatus(ctx, {
+          kind: "plan",
+          draft: { model: `${NO_WRITER_MODEL.provider}/${NO_WRITER_MODEL.id}`, chars: spliced.length },
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Plan update accepted: removed ${removals.join(", ")} with no writer session (nothing to regenerate); ${spliced.length} chars drafted. Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
+            },
+          ],
+          details: { slug: writeSlug, rewritten: headings, dropped: removals, markdownChars: spliced.length },
+        };
+      }
+
+      const result = await expandPlanUpdateToMarkdown(pi, ctx, cfg.writerModel, delta, splitPlanSections(currentText));
+      if ("error" in result) {
+        showStatus(ctx, { kind: "failed", mode: "plan", message: result.error });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Plan update expansion failed: ${result.error}. The plan file is unchanged; write the plan Markdown yourself with the write tool (content must be the full Markdown, never "${PLACEHOLDER_CONTENT}") and continue with xd://propose.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Only sections the writer actually emitted may be spliced, so a response
+      // that ignored the requested headings cannot silently write the old text.
+      const emitted = splitPlanSections(result.markdown);
+      const emittedByKey = new Map(emitted.sections.map(section => [planHeadingKey(section.heading), section]));
+      const replacements: PlanSection[] = [];
+      const unrendered: string[] = [];
+      for (const heading of headings) {
+        const section = emittedByKey.get(planHeadingKey(heading));
+        if (section === undefined) unrendered.push(heading);
+        else replacements.push(section);
+      }
+      if (unrendered.length > 0) {
+        const missing = `the writer model returned no "${unrendered.join('", "')}" section heading`;
+        showStatus(ctx, { kind: "failed", mode: "plan", message: missing });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Plan update rejected: ${missing}, so nothing could be spliced. The plan file is unchanged; retry ${PLAN_UPDATE_TOOL_NAME} or write the plan Markdown yourself with the write tool (never the content "${PLACEHOLDER_CONTENT}").`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const spliced = splicePlanSections(currentText, replacements, removals);
+      store.set(writeSlug, {
+        sessionKey: key,
+        markdown: spliced,
+        writerModel: result.model,
+        writerUsage: result.usage,
+        writerCostUsd: result.costUsd,
+        irOutputTokens: estimateBlueprintTokens(params),
+        /** Only the regenerated sections count against the baseline: the brain
+         *  would have re-emitted those, not the whole document. */
+        deltaDocOutputTokens: estimateTextTokens(replacements.map(section => section.text).join("")),
+        literalMetrics: result.literalMetrics,
+      });
+
+      showStatus(ctx, {
+        kind: "plan",
+        draft: { model: `${result.model.provider}/${result.model.id}`, chars: spliced.length },
+      });
+
+      const fidelityLine = formatFidelityLine(result.fidelity, result.literalMetrics);
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Plan update accepted: ${headings.join(", ")} rewritten by "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model) and spliced into local://${writeSlug}-plan.md (${spliced.length} chars). Call write with path "local://${writeSlug}-plan.md" and content "${PLACEHOLDER_CONTENT}" to finalize, then continue with xd://propose using slug "${writeSlug}".`,
+              fidelityLine,
+            ]
+              .filter(part => part !== "")
+              .join(" "),
+          },
+        ],
+        details: {
+          slug: writeSlug,
+          rewritten: headings,
+          dropped: removals,
+          markdownChars: spliced.length,
+          writerModel: `${result.model.provider}/${result.model.id}`,
+          fidelity: result.fidelity,
+          literalMetrics: result.literalMetrics,
+        },
       };
     },
   });
@@ -243,23 +602,27 @@ export default function scribe(pi: ExtensionAPI): void {
     name: DOC_BLUEPRINT_TOOL_NAME,
     label: "Propose Doc Blueprint",
     description:
-      "Doc-blueprint mode only (after /scribe-doc). Submit a compact JSON outline instead of composing the full Markdown document yourself. A separate lightweight model expands it into the final document at the exact path you declare. Call this exactly once per document.",
+      "Doc-blueprint mode only (after /scribe-doc). Submit a compact JSON outline; a lightweight model expands it into the file.",
     parameters: z.object({
       slug: z
         .string()
-        .regex(/^[a-z0-9][a-z0-9-]*$/)
-        .describe("kebab-case identifier for this document"),
-      title: z.string().describe("Document title (used as the H1 heading)"),
+        .regex(/^[a-z0-9][a-z0-9-]*$/),
+      title: z.string().describe("Document title (H1)"),
       path: z.string().describe("exact write target, e.g. README.md or docs/ARCHITECTURE.md"),
       sections: z
         .array(
           z.object({
             heading: z.string().describe("Section heading (H2)"),
-            bullets: z.array(z.string()).min(1).describe("Ordered bullet points for this section"),
+            bullets: z.array(z.string()).min(1),
           }),
         )
-        .min(1)
-        .describe("Ordered document sections"),
+        .min(1),
+      literals: z
+        .array(z.array(z.unknown()).min(2).max(2))
+        .optional()
+        .describe(
+          LITERALS_PARAM_DESCRIPTION,
+        ),
     }),
     approval: "read",
     strict: true,
@@ -284,6 +647,7 @@ export default function scribe(pi: ExtensionAPI): void {
         writerCostUsd: result.costUsd,
         irOutputTokens: estimateBlueprintTokens(params),
         slug: blueprint.slug,
+        literalMetrics: result.literalMetrics,
       });
       docDraftHistory().set(blueprint.path, sessionKey(ctx));
 
@@ -292,14 +656,27 @@ export default function scribe(pi: ExtensionAPI): void {
         draft: { model: `${result.model.provider}/${result.model.id}`, chars: result.markdown.length },
       });
 
+      const fidelityLine = formatFidelityLine(result.fidelity, result.literalMetrics);
       return {
         content: [
           {
             type: "text",
-            text: `Doc blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "${blueprint.path}" and content "${PLACEHOLDER_CONTENT}" to finalize.`,
+            text: [
+              `Doc blueprint accepted; delegated to writer model "${result.model.provider}/${result.model.id}" (configurable via --scribe-writer-model); ${result.markdown.length} chars of Markdown drafted. Call write with path "${blueprint.path}" and content "${PLACEHOLDER_CONTENT}" to finalize.`,
+              fidelityLine,
+            ]
+              .filter(part => part !== "")
+              .join(" "),
           },
         ],
-        details: { slug: blueprint.slug, path: blueprint.path, markdownChars: result.markdown.length, writerModel: `${result.model.provider}/${result.model.id}` },
+        details: {
+          slug: blueprint.slug,
+          path: blueprint.path,
+          markdownChars: result.markdown.length,
+          writerModel: `${result.model.provider}/${result.model.id}`,
+          fidelity: result.fidelity,
+          literalMetrics: result.literalMetrics,
+        },
       };
     },
   });
@@ -307,7 +684,7 @@ export default function scribe(pi: ExtensionAPI): void {
   // ─── tool_result blueprint-failure tracking & write-swap annotation ─────
   pi.on("tool_result", async (event, ctx) => {
     if (event.isError) {
-      if (event.toolName !== BLUEPRINT_TOOL_NAME && event.toolName !== DOC_BLUEPRINT_TOOL_NAME) return;
+      if (!SCRIBE_TOOL_NAMES.includes(event.toolName)) return;
       try {
         await appendBlueprintFailure(ctx.cwd);
       } catch (error) {
@@ -334,32 +711,26 @@ export default function scribe(pi: ExtensionAPI): void {
 
   // ─── before_agent_start ───────────────────────────────────────────────────
   pi.on("before_agent_start", async (event, ctx) => {
-    const wantsBlueprintTool = isPlanModeActive(ctx);
-    if (wantsBlueprintTool) { brainUsage = { input: 0, output: 0 }; brainModelId = undefined; brainCostUsd = 0; brainOutputRatePerMillionUsd = 0; }
+    const wantsPlanTools = isPlanModeActive(ctx);
+    if (wantsPlanTools) { brainUsage = { input: 0, output: 0 }; brainModelId = undefined; brainCostUsd = 0; brainOutputRatePerMillionUsd = 0; }
     const wantsDocTool = armedDocSessions().has(sessionKey(ctx));
     showStatus(ctx, baseStatus(ctx));
 
     const activeTools = pi.getActiveTools();
     const hasBlueprintTool = activeTools.includes(BLUEPRINT_TOOL_NAME);
-    const hasDocTool = activeTools.includes(DOC_BLUEPRINT_TOOL_NAME);
 
-    if (wantsBlueprintTool !== hasBlueprintTool || wantsDocTool !== hasDocTool) {
-      let nextTools = [...activeTools];
-      if (wantsBlueprintTool !== hasBlueprintTool) {
-        nextTools = wantsBlueprintTool
-          ? [...nextTools, BLUEPRINT_TOOL_NAME]
-          : nextTools.filter(name => name !== BLUEPRINT_TOOL_NAME);
-      }
-      if (wantsDocTool !== hasDocTool) {
-        nextTools = wantsDocTool
-          ? [...nextTools, DOC_BLUEPRINT_TOOL_NAME]
-          : nextTools.filter(name => name !== DOC_BLUEPRINT_TOOL_NAME);
-      }
-      await pi.setActiveTools(nextTools);
+    const toEnable = PLAN_MODE_TOOL_NAMES.filter(name => wantsPlanTools && !activeTools.includes(name));
+    const toDisable = PLAN_MODE_TOOL_NAMES.filter(name => !wantsPlanTools && activeTools.includes(name));
+    if (wantsDocTool !== activeTools.includes(DOC_BLUEPRINT_TOOL_NAME)) {
+      if (wantsDocTool) toEnable.push(DOC_BLUEPRINT_TOOL_NAME);
+      else toDisable.push(DOC_BLUEPRINT_TOOL_NAME);
+    }
+    if (toEnable.length > 0 || toDisable.length > 0) {
+      await pi.setActiveTools([...activeTools.filter(name => !toDisable.includes(name)), ...toEnable]);
     }
 
     // Plan-mode banner fires only on the transition INTO plan mode.
-    if (wantsBlueprintTool && !hasBlueprintTool && ctx.hasUI) {
+    if (wantsPlanTools && !hasBlueprintTool && ctx.hasUI) {
       const resolved = resolveWriterModel(ctx, cfg.writerModel);
       if (resolved) {
         ctx.ui.notify(`Scribe: plan mode — writer model resolved to ${resolved.provider}/${resolved.id}.`, "info");
@@ -368,7 +739,7 @@ export default function scribe(pi: ExtensionAPI): void {
       }
     }
 
-    if (wantsBlueprintTool && cfg.brainModel) {
+    if (wantsPlanTools && cfg.brainModel) {
       const resolved = ctx.models.resolve(cfg.brainModel);
       const current = ctx.models.current();
       if (resolved && !sameModel(resolved, current)) {
@@ -379,7 +750,7 @@ export default function scribe(pi: ExtensionAPI): void {
     }
 
     const additions: string[] = [];
-    if (wantsBlueprintTool) additions.push(SCRIBE_DIRECTIVE);
+    if (wantsPlanTools) additions.push(SCRIBE_DIRECTIVE);
     if (wantsDocTool) additions.push(DOC_SCRIBE_DIRECTIVE);
     if (additions.length === 0) return;
     return { systemPrompt: [...event.systemPrompt, ...additions] };
@@ -411,11 +782,15 @@ export default function scribe(pi: ExtensionAPI): void {
             : "unknown/unknown");
         const writerModel = `${entry.writerModel.provider}/${entry.writerModel.id}`;
         const referenceRates = planRoleReferenceRates(ctx);
+        /** An incremental update prices only the sections it regenerated; a full
+         *  draft is measured on the returned document. */
+        const docOutputTokens = entry.deltaDocOutputTokens ?? estimateTextTokens(entry.markdown);
         const costs = computeCosts({
           brainActualTotalCostUsd: brainCostUsd,
           writerActualCostUsd: entry.writerCostUsd,
           brainOutputRatePerMillionUsd,
-          writerOutputTokens: entry.writerUsage.output,
+          documentOutputTokens: docOutputTokens,
+          blueprintOutputTokens: entry.irOutputTokens,
           brainInputTokens: brainUsage.input,
           referenceInputRatePerMillionUsd: referenceRates.input,
           referenceOutputRatePerMillionUsd: referenceRates.output,
@@ -437,6 +812,11 @@ export default function scribe(pi: ExtensionAPI): void {
           priced: costs.priced,
           baselineIsEstimate: costs.baselineIsEstimate,
           irOutputTokens: entry.irOutputTokens,
+          docOutputTokens,
+          literalResolved: entry.literalMetrics?.resolved ?? 0,
+          llmRepairCalls: entry.literalMetrics?.repairRounds ?? 0,
+          llmRepairInputTokens: entry.literalMetrics?.repairInputTokens ?? 0,
+          llmRepairOutputTokens: entry.literalMetrics?.repairOutputTokens ?? 0,
         };
         try {
           await appendSavingsRun(ctx.cwd, runEntry);
@@ -462,7 +842,7 @@ export default function scribe(pi: ExtensionAPI): void {
         const recovery =
           pending.length > 0
             ? ` Pending drafts: ${pending.join(", ")} — write one of them as local://<slug>-plan.md with content "${PLACEHOLDER_CONTENT}".`
-            : ` Call ${BLUEPRINT_TOOL_NAME} first, then retry this write with content "${PLACEHOLDER_CONTENT}".`;
+            : ` Call ${BLUEPRINT_TOOL_NAME} first (or ${PLAN_UPDATE_TOOL_NAME} to revise a plan that already exists), then retry this write with content "${PLACEHOLDER_CONTENT}".`;
         return {
           block: true,
           reason: `No drafted Markdown matches "${input.path}".${recovery}`,
@@ -488,11 +868,14 @@ export default function scribe(pi: ExtensionAPI): void {
           : "unknown/unknown");
       const writerModel = `${docEntry.writerModel.provider}/${docEntry.writerModel.id}`;
       const referenceRates = planRoleReferenceRates(ctx);
+      /** Measured on the returned document, not the writer's raw output. */
+      const docOutputTokens = estimateTextTokens(docEntry.markdown);
       const costs = computeCosts({
         brainActualTotalCostUsd: brainCostUsd,
         writerActualCostUsd: docEntry.writerCostUsd,
         brainOutputRatePerMillionUsd,
-        writerOutputTokens: docEntry.writerUsage.output,
+        documentOutputTokens: docOutputTokens,
+        blueprintOutputTokens: docEntry.irOutputTokens,
         brainInputTokens: brainUsage.input,
         referenceInputRatePerMillionUsd: referenceRates.input,
         referenceOutputRatePerMillionUsd: referenceRates.output,
@@ -514,6 +897,11 @@ export default function scribe(pi: ExtensionAPI): void {
         priced: costs.priced,
         baselineIsEstimate: costs.baselineIsEstimate,
         irOutputTokens: docEntry.irOutputTokens,
+        docOutputTokens,
+        literalResolved: docEntry.literalMetrics?.resolved ?? 0,
+        llmRepairCalls: docEntry.literalMetrics?.repairRounds ?? 0,
+        llmRepairInputTokens: docEntry.literalMetrics?.repairInputTokens ?? 0,
+        llmRepairOutputTokens: docEntry.literalMetrics?.repairOutputTokens ?? 0,
       };
       try {
         await appendSavingsRun(ctx.cwd, runEntry);

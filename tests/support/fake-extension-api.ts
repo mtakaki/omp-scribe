@@ -33,6 +33,10 @@ export interface FakeContextOverrides {
    *  The array is returned as-is, letting a test mutate it to simulate a mode
    *  transition between turns. */
   branch?: unknown[];
+  /** Directory `ctx.localProtocolOptions.getArtifactsDir()` reports; the plan
+   *  artifact resolver looks for `local://` files under its `local/` child.
+   *  `null`/absent leaves only the OS-temp fallback root. */
+  artifactsDir?: string | null;
 }
 
 /** One `ctx.ui.select()` invocation: the dialog title plus the normalized
@@ -78,7 +82,10 @@ export function createFakeExtensionContext(overrides: FakeContextOverrides = {})
     modelRegistry: {
       authStorage: {},
     },
-    localProtocolOptions: undefined,
+    localProtocolOptions: {
+      getArtifactsDir: () => overrides.artifactsDir ?? null,
+      getSessionId: () => overrides.sessionId ?? "fake-session",
+    },
     ui: {
       notify: (message: string, level: string) => {
         notifications.push({ message, level });
@@ -149,6 +156,8 @@ export interface FakeExtensionApi {
   activeTools: string[];
   flagValues: Map<string, boolean | string | undefined>;
   warnings: string[];
+  /** Every `pi.logger.info()` line, in order. */
+  infos: string[];
   /** Call the execute handler of a registered tool by name. */
   callTool(name: string, toolCallId: string, params: unknown, ctx: ExtensionContext): Promise<unknown>;
 }
@@ -161,6 +170,7 @@ export function createFakeExtensionApi(): FakeExtensionApi {
   let activeTools: string[] = [];
   const flagValues = new Map<string, boolean | string | undefined>();
   const warnings: string[] = [];
+  const infos: string[] = [];
 
   async function emit(event: string, ...args: unknown[]): Promise<unknown> {
     let result: unknown;
@@ -201,7 +211,7 @@ export function createFakeExtensionApi(): FakeExtensionApi {
     logger: {
       warn: (msg: string) => { warnings.push(msg); },
       debug: () => {},
-      info: () => {},
+      info: (msg: string) => { infos.push(msg); },
       error: () => {},
     },
     zod: z,
@@ -246,6 +256,7 @@ export function createFakeExtensionApi(): FakeExtensionApi {
     get activeTools() { return activeTools; },
     flagValues,
     warnings,
+    infos,
     callTool,
   };
 }

@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { estimateTextTokens } from "./token-accounting";
 
 /** Project-relative path for the persisted savings stats JSON file. */
 export const SAVINGS_STATS_RELATIVE_PATH = ".claude/plans/savings_stats.json";
@@ -21,6 +22,12 @@ export interface SavingsRunLogEntry {
   /** Estimated tokens the brain spent emitting the compact blueprint JSON instead
    *  of the document body; absent in legacy entries (treat as 0). */
   irOutputTokens?: number;
+  /** Estimated tokens of the Markdown document the writer returned for this run,
+   *  at ~4 characters per token (see {@link estimateTextTokens}).  Measures the
+   *  returned document rather than the writer's raw `usage.output`, which is
+   *  inflated by generation that never reached the returned Markdown.  Absent in
+   *  legacy entries, which fall back to `writerOutputTokens`. */
+  docOutputTokens?: number;
   /** Actual cost in USD charged by the writer model alone for this run
    *  (sourced from ExpandResult.costUsd); zero for local/free writer models. */
   writerCostUsd: number;
@@ -33,6 +40,18 @@ export interface SavingsRunLogEntry {
    *  model's rates because the live brain model had no catalog rate of its own;
    *  absent in legacy entries (treat as `false`). */
   baselineIsEstimate?: boolean;
+  /** `[[lit:<id>]]` markers the extension substituted with their declared
+   *  literal value, counted per occurrence.  Zero for a run that declared no
+   *  table. */
+  literalResolved?: number;
+  /** LLM literal-repair rounds the fidelity gate ran for this run.  A declared
+   *  literal the writer omitted is reported, never repaired, so the usual value
+   *  is 0. */
+  llmRepairCalls?: number;
+  /** Input tokens those repair rounds spent; a subset of `writerInputTokens`. */
+  llmRepairInputTokens?: number;
+  /** Output tokens those repair rounds spent; a subset of `writerOutputTokens`. */
+  llmRepairOutputTokens?: number;
 }
 
 /** Persisted cumulative stats plus a capped recent-run log.
@@ -68,6 +87,11 @@ export interface SavingsStatsFile {
   /** Cumulative blueprint tokens the brain emitted instead of the document
    *  body; optional for backward compat with earlier files. */
   totalIrOutputTokens?: number;
+  /** Cumulative estimated tokens of the returned Markdown documents across all
+   *  runs; optional for backward compat with earlier files, whose entries carry
+   *  no per-run `docOutputTokens` and are measured by `writerOutputTokens`
+   *  instead. */
+  totalDocOutputTokens?: number;
   /** Total count of blueprint tool calls: incremented once per successful run
    *  in `appendSavingsRun` and once per failed call in `appendBlueprintFailure`.
    *  Required (not optional) — a pre-migration file missing this field fails
@@ -77,6 +101,17 @@ export interface SavingsStatsFile {
   /** Count of blueprint tool calls whose result was an error (the writer
    *  expansion failed). Required for the same reason as `blueprintCallsTotal`. */
   blueprintCallsFailed: number;
+  /** Cumulative `[[lit:<id>]]` markers substituted deterministically; optional
+   *  for backward compat with earlier files. */
+  totalLiteralResolved?: number;
+  /** Cumulative LLM literal-repair rounds; optional for backward compat. */
+  totalLlmRepairCalls?: number;
+  /** Cumulative input tokens spent on literal repair; optional for backward
+   *  compat. */
+  totalLlmRepairInputTokens?: number;
+  /** Cumulative output tokens spent on literal repair; optional for backward
+   *  compat. */
+  totalLlmRepairOutputTokens?: number;
   /** Most-recent runs first; capped at 200. */
   runs: SavingsRunLogEntry[];
 }
@@ -102,8 +137,13 @@ function emptyStatsFile(): SavingsStatsFile {
     totalPaidWriterNetSavingsUsd: 0,
     totalEstimatedBaselineRuns: 0,
     totalIrOutputTokens: 0,
+    totalDocOutputTokens: 0,
     blueprintCallsTotal: 0,
     blueprintCallsFailed: 0,
+    totalLiteralResolved: 0,
+    totalLlmRepairCalls: 0,
+    totalLlmRepairInputTokens: 0,
+    totalLlmRepairOutputTokens: 0,
     runs: [],
   };
 }
@@ -122,6 +162,13 @@ function isSavingsStatsFile(value: unknown): value is SavingsStatsFile {
 
 function statsFilePath(cwd: string): string {
   return join(cwd, SAVINGS_STATS_RELATIVE_PATH);
+}
+
+/** Sum the returned-document token estimate over `runs`, falling back to
+ *  `writerOutputTokens` for legacy entries that predate `docOutputTokens`.
+ *  Used to seed `totalDocOutputTokens` when a pre-existing ledger lacks it. */
+function docTokensFromRuns(runs: SavingsRunLogEntry[]): number {
+  return runs.reduce((sum, run) => sum + (run.docOutputTokens ?? run.writerOutputTokens), 0);
 }
 
 /** Read the persisted stats file.  Returns a clean zeroed structure on ENOENT,
@@ -165,8 +212,15 @@ export async function appendSavingsRun(cwd: string, entry: SavingsRunLogEntry): 
     totalPaidWriterNetSavingsUsd: (current.totalPaidWriterNetSavingsUsd ?? 0) + (isFreeWriter ? 0 : entry.netSavingsUsd),
     totalEstimatedBaselineRuns: (current.totalEstimatedBaselineRuns ?? 0) + (entry.baselineIsEstimate ? 1 : 0),
     totalIrOutputTokens: (current.totalIrOutputTokens ?? 0) + (entry.irOutputTokens ?? 0),
+    totalDocOutputTokens:
+      (current.totalDocOutputTokens ?? docTokensFromRuns(current.runs)) +
+      (entry.docOutputTokens ?? entry.writerOutputTokens),
     blueprintCallsTotal: current.blueprintCallsTotal + 1,
     blueprintCallsFailed: current.blueprintCallsFailed,
+    totalLiteralResolved: (current.totalLiteralResolved ?? 0) + (entry.literalResolved ?? 0),
+    totalLlmRepairCalls: (current.totalLlmRepairCalls ?? 0) + (entry.llmRepairCalls ?? 0),
+    totalLlmRepairInputTokens: (current.totalLlmRepairInputTokens ?? 0) + (entry.llmRepairInputTokens ?? 0),
+    totalLlmRepairOutputTokens: (current.totalLlmRepairOutputTokens ?? 0) + (entry.llmRepairOutputTokens ?? 0),
     runs: [entry, ...current.runs].slice(0, 200),
   };
 
@@ -222,12 +276,18 @@ function dataRow(label: string, value: string): string {
   return `║${content}║`;
 }
 
+/** The ~4-characters-per-token estimate the savings ledger measures with, owned
+ *  by `src/token-accounting.ts` (where it is also the explicit fallback for a
+ *  platform without the native tokenizer) and re-exported here so the ledger and
+ *  its callers keep their existing import site. */
+export { estimateTextTokens };
+
 /** Estimated token count of a compact blueprint JSON payload, at ~4 characters
  *  per token.  Subtracted from the brain's output when reporting how much it
  *  would have emitted had it authored the document body itself, since the
  *  blueprint exists only because of scribe. */
 export function estimateBlueprintTokens(blueprint: unknown): number {
-  return Math.round(JSON.stringify(blueprint).length / 4);
+  return estimateTextTokens(JSON.stringify(blueprint));
 }
 
 /** Render a full ASCII dashboard of `stats` as a multi-line string.
@@ -240,10 +300,15 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
   const estimatedRuns = stats.totalEstimatedBaselineRuns ?? 0;
   /** Aggregate savings carry a `~` while any contributing baseline is an estimate. */
   const estimateMark = estimatedRuns > 0 ? "~" : "";
+  /** Blueprint tokens the brain emitted in place of the document body. */
+  const blueprintOutputTokens = stats.totalIrOutputTokens ?? 0;
+  /** The returned document's estimated tokens; legacy ledgers without the total
+   *  are seeded from the recent-run log, falling back to `writerOutputTokens`. */
+  const documentOutputTokens = stats.totalDocOutputTokens ?? docTokensFromRuns(stats.runs);
   /** Without scribe the brain emits the document body in place of the blueprint,
-   *  so re-add what the writer produced and drop what the blueprint cost. */
+   *  so re-add the returned document's tokens and drop what the blueprint cost. */
   const estimatedBrainOutputTokens =
-    stats.totalBrainOutputTokens + stats.totalWriterOutputTokens - (stats.totalIrOutputTokens ?? 0);
+    stats.totalBrainOutputTokens - blueprintOutputTokens + documentOutputTokens;
   const usd = (n: number) => `$${n.toFixed(4)}`;
   const num = (n: number) => n.toLocaleString("en-US");
   const blueprintCallsTotal = stats.blueprintCallsTotal ?? 0;
@@ -271,6 +336,14 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
     dataRow("Brain tokens output", num(stats.totalBrainOutputTokens)),
     dataRow("Writer tokens input", num(stats.totalWriterInputTokens)),
     dataRow("Writer tokens output", num(stats.totalWriterOutputTokens)),
+    dataRow("Blueprint tokens (brain, est.)", num(blueprintOutputTokens)),
+    dataRow("Delegated doc tokens (est.)", num(documentOutputTokens)),
+    dataRow("Literals resolved (deterministic)", num(stats.totalLiteralResolved ?? 0)),
+    dataRow("LLM literal-repair calls", num(stats.totalLlmRepairCalls ?? 0)),
+    dataRow(
+      "LLM repair tokens (in+out)",
+      num((stats.totalLlmRepairInputTokens ?? 0) + (stats.totalLlmRepairOutputTokens ?? 0)),
+    ),
     dataRow("Estimated brain tokens output without scribe", num(estimatedBrainOutputTokens)),
     SEP,
     dataRow("Free/local writer runs", num(stats.totalFreeWriterRuns ?? 0)),
@@ -306,6 +379,17 @@ export function formatSavingsDashboard(stats: SavingsStatsFile): string {
         `@plan-role reference model's rates; savings marked "~$" are estimates, not billed amounts.`,
     );
   }
+
+  lines.push(
+    `ℹ  "Writer tokens output" is the writer model's raw usage, which includes generation that never reached the ` +
+      `returned document; "Delegated doc tokens (est.)" measures the Markdown actually returned (~4 chars/token), and the ` +
+      `without-scribe row uses that figure.`,
+  );
+
+  lines.push(
+    `ℹ  Literals are declared in the planner's "literals" table and referenced as [[lit:<id>]] markers, so the extension ` +
+      `substitutes them deterministically; an LLM literal-repair call runs only for a literal the planner never declared.`,
+  );
 
   return lines.join("\n");
 }

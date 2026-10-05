@@ -1,0 +1,32 @@
+{
+  "slug": "session-rotation",
+  "title": "Harden session rotation and report writer-stage token cost",
+  "context": "Refresh tokens stay reusable for their whole lifetime and the writer pipeline reports no per-stage token cost. Rotate the signing key on every refresh, reject a reused nonce, and report the writer payload's real token breakdown so the plan budget is measurable.",
+  "literals": [
+    ["A1", "__Host-scribe_session"],
+    ["A2", "SESSION_ROTATED"]
+  ],
+  "files": [
+    ["A", "src/auth/session-store.ts", "session persistence, rotation, and cookie issuance"],
+    ["B", "src/plan-mode/model-transition.ts", "plan-role resolution and the writable-mode handoff"],
+    ["C", "src/writer-session.ts", "nested writer session spawning and brief assembly"],
+    ["D", "tests/auth/session-store-cases.ts", "existing coverage for rotation and revocation"]
+  ],
+  "steps": [
+    ["A", "~", [42, 67], "Rotate the signing key on every refresh and reissue the [[lit:A1]] cookie under the rotated key.", ["preserve the existing cookie attributes"], ["do not touch the legacy v1 verifier"]],
+    ["A", "~", [88, 96], "Reject a refresh whose nonce was already consumed and return the [[lit:A2]] error code.", [], []],
+    ["B", "~", [15, 40], "Resolve the plan role from modelRoles.plan before the writable-mode handoff.", ["preserve the current role precedence"], ["do not change the default writer role"]],
+    ["B", "+", null, "Add a capability probe that reads the catalog once per session and caches the result.", [], []],
+    ["C", "~", [61, 88], "Thread the hydrated snippet text into the token accounting so the diagnostic can report snippets apart from the rest of the brief.", [], []],
+    ["D", "+", null, "Cover the rotation path with a fixed clock and a tampered nonce.", [], []],
+    ["D", "~", [1, 12], "Extend the revocation case to assert the returned error code.", ["keep the existing fixtures"], []]
+  ],
+  "verification": [
+    "bun test tests/auth/session-store-cases.ts passes with the rotation and revocation cases green",
+    "grep for [[lit:A2]] under src/auth returns exactly one call site"
+  ],
+  "assumptions": [
+    "The cookie name stays [[lit:A1]] because the host already scopes it to the session subdomain",
+    "Nonce storage may stay in memory: the session store is process-local"
+  ]
+}

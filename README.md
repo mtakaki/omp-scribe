@@ -72,6 +72,11 @@ Example output (recent-run slugs anonymized; every other figure is real accumula
 ║  Brain tokens output                                  729,819  ║
 ║  Writer tokens input                                  111,779  ║
 ║  Writer tokens output                                 116,125  ║
+║  Blueprint tokens (brain, est.)                             0  ║
+║  Delegated doc tokens (est.)                          116,125  ║
+║  Literals resolved (deterministic)                          0  ║
+║  LLM literal-repair calls                                   0  ║
+║  LLM repair tokens (in+out)                                 0  ║
 ║  Estimated brain tokens output without scribe         845,944  ║
 ╟────────────────────────────────────────────────────────────────╢
 ║  Free/local writer runs                                    16  ║
@@ -88,6 +93,7 @@ Example output (recent-run slugs anonymized; every other figure is real accumula
 ║    2026-09-20  optimize-query-cache                   $0.0345  ║
 ╚────────────────────────────────────────────────────────────────╝
 ⚠  4 run(s) used a brain model with no known per-token output rate in the catalog (e.g. a local/custom model); their baseline (and net savings) is recorded as $0.00 unless an @plan-role estimate replaced it — real baseline may be higher.
+ℹ  "Writer tokens output" is the writer model's raw usage, which includes generation that never reached the returned document; "Delegated doc tokens (est.)" measures the Markdown actually returned (~4 chars/token), and the without-scribe row uses that figure.
 ```
 
 The `/savings` command renders an ASCII dashboard summarizing the cumulative data in `.claude/plans/savings_stats.json`. Rows appear in this exact top-to-bottom order (labels below match the literal strings in `formatSavingsDashboard`, `src/stats-store.ts`):
@@ -105,8 +111,13 @@ The `/savings` command renders an ASCII dashboard summarizing the cumulative dat
 - `Brain tokens input` — cumulative input tokens consumed by the expensive (brain) model across all runs (`totalBrainInputTokens`).
 - `Brain tokens output` — cumulative output tokens produced by the brain model (`totalBrainOutputTokens`).
 - `Writer tokens input` — cumulative input tokens consumed by the cheap writer model that expands blueprints into Markdown (`totalWriterInputTokens`).
-- `Writer tokens output` — cumulative output tokens produced by the writer model (`totalWriterOutputTokens`).
-- `Estimated brain tokens output without scribe` — what the brain would have emitted had it authored every document body itself: `totalBrainOutputTokens` + `totalWriterOutputTokens` − `totalIrOutputTokens`, the blueprint JSON the brain emits only because of scribe (estimated at roughly four characters per token). Files predating blueprint-token tracking lack `totalIrOutputTokens` and read as zero, so the estimate then subtracts nothing and is an upper bound.
+- `Writer tokens output` — cumulative output tokens reported by the writer model's session (`totalWriterOutputTokens`). This is raw generation, which can exceed what the returned documents actually contain.
+- `Blueprint tokens (brain, est.)` — cumulative estimated tokens the brain spent emitting the compact blueprint JSON in place of the document body (`totalIrOutputTokens`), at roughly four characters per token. Legacy files predating blueprint-token tracking lack the total and read as zero.
+- `Delegated doc tokens (est.)` — cumulative estimated tokens of the Markdown documents the writer actually returned (`totalDocOutputTokens`), at roughly four characters per token. A legacy ledger lacking the total seeds it from its own run log, using each entry's `docOutputTokens` when present and otherwise that entry's `writerOutputTokens`.
+- `Literals resolved (deterministic)` — cumulative count of planner-declared `[[lit:<id>]]` markers the extension substituted with their exact table value, with no LLM involvement (`totalLiteralResolved`).
+- `LLM literal-repair calls` — cumulative repair sessions the gate spent restoring load-bearing literals a draft lost: a declared one is restored by re-emitting its `[[lit:<id>]]` marker (the extension substitutes the exact value afterwards), an undeclared one by spelling the value verbatim. A literal the repair pass cannot restore, or one that already survives elsewhere in the plan, is reported instead (`totalLlmRepairCalls`).
+- `LLM repair tokens (in+out)` — summed input and output tokens those repair calls consumed (`totalLlmRepairInputTokens` plus `totalLlmRepairOutputTokens`).
+- `Estimated brain tokens output without scribe` — what the brain would have emitted had it authored every document body itself: `totalBrainOutputTokens` − `totalIrOutputTokens` + `totalDocOutputTokens`. The blueprint JSON exists only because of scribe, so it is credited back out, and the returned document's own measure (`Delegated doc tokens (est.)`) is added in rather than the writer's raw output. A legacy ledger lacking both totals treats the blueprint as zero and seeds the document total from its run log, so a ledger whose retained runs still cover every run keeps the figure it reported before this change.
 
 **Writer-cost breakdown**
 - `Free/local writer runs` — count of runs where the writer model was free/local, i.e. `writerCostUsd === 0` for that run (`totalFreeWriterRuns`).
@@ -122,12 +133,65 @@ The `/savings` command renders an ASCII dashboard summarizing the cumulative dat
 **Footnotes** (each shown only when applicable)
 - `⚠  <n> run(s) used a brain model with no known per-token output rate in the catalog...` — appears when `totalUnpricedRuns > 0`; warns that those runs' baseline (and therefore savings) defaulted to $0.00 unless an `@plan`-role estimate replaced it.
 - `ℹ  <n> run(s) had no catalog rate for the live brain model...` — appears when `totalEstimatedBaselineRuns > 0`; clarifies that the `~$`-marked figures above are `@plan`-role-derived estimates, not billed amounts.
+- `ℹ  "Writer tokens output" is the writer model's raw usage...` — always shown; distinguishes the writer session's raw generation from `Delegated doc tokens (est.)`, the measure of the Markdown actually returned, and notes that the without-scribe row uses the latter.
+- `ℹ  Literals are declared in the planner's "literals" table...` — always shown; notes that `[[lit:<id>]]` markers are substituted deterministically and that an LLM literal-repair call runs only for a literal the repair pass could not restore — the gate skips a literal that already survives elsewhere in the plan.
 
 ## How does it work
 
-**Plan mode** runs automatically: the plan model calls `propose_plan_blueprint` with compact JSON metadata plus **Scribe IR** — a `files` table of 3-element `[id, path, reason]` tuples and a `steps` array of 6-element `[fileId, operation, range|null, intent, preserve[], doNot[]]` tuples, structurally validated by `src/scribe-ir.ts` — then writes the literal placeholder `"pending"` (7 bytes) as the plan file's content. The extension substitutes the expanded Markdown into that pending `write` before the native tool executes, so the expensive model never emits the document body itself.
+**Plan mode** runs automatically: the plan model calls `propose_plan_blueprint` with compact JSON metadata plus **Scribe IR** — a `files` table of 3-element `[id, path, reason]` tuples and a `steps` array of 6-element `[fileId, operation, range|null, intent, preserve[], doNot[]]` tuples, structurally validated by `src/scribe-ir.ts`, plus an optional `literals` table of 2-element `[id, value]` tuples validated by `src/literal-fidelity.ts` — then writes the literal placeholder `"pending"` (7 bytes) as the plan file's content. Each literal is declared once: an id matching `[A-Za-z][A-Za-z0-9_-]{0,31}` and unique case-insensitively, with a value of at most 8000 characters. Inside `context`, a file `reason`, a step's `intent`/`preserve`/`doNot`, `verification`, or `assumptions`, the planner writes the `[[lit:<id>]]` marker wherever that value belongs instead of typing the value itself; the extension substitutes the exact value after the writer responds, so the writer never types it. The `lit:` sentinel is what makes a marker a marker: a double-bracket span without it — a wrangler.toml array-of-tables header such as `[[env.staging.analytics_engine_datasets]]`, a `[[routes]]`-shaped token — is ordinary project text the blueprint may quote verbatim, so quoting it never reads as a reference to an undeclared literal. A rejected blueprint call is retried once: the plan model corrects exactly the problem the tool names and calls it again, and only a second rejection makes it fall back to handwriting the plan body with `write`. The extension substitutes the expanded Markdown into that pending `write` before the native tool executes, so the expensive model never emits the document body itself.
+
+**Plan refinement** stays inside the same delegation. Once the plan file exists, the plan model must not rewrite it and must not call the blueprint tool again: it calls `propose_plan_update` with only the fields that changed — `literals` (any new exact string, referenced by its marker), `context`, `files` together with `steps`, `verification`, `assumptions`, and optionally `drop` — then writes the placeholder again. The writer model rewrites just those sections against the plan's current text (read from disk, or from the draft still awaiting its write when several refinements land in one turn), and `src/plan-sections.ts` splices them back in: a section the update did not name keeps its exact bytes, a missing heading is inserted at its canonical position, an unknown one is appended, and `drop` deletes the named sections. Cost reporting follows the same rule — an update's run records only the regenerated sections' token estimate, not the whole document — and a `drop`-only update needs no writer session at all. If a refinement cannot be located, expanded, or parsed, the tool reports it and the plan file is left untouched rather than half-spliced.
 
 Scribe IR replaced the earlier Tokenized Architectural Diff string DSL (`@path[start-end]{op}deps(...)#intent`), whose single hand-rolled regex needed follow-up fixes for paths containing brackets or parentheses and for single-line range shorthand, and which forced five files to stay in lock-step for any format tweak; Scribe IR rides ordinary JSON tool-call arrays and reports precise per-field errors (duplicate file id, unknown file id, invalid operation, inverted range, empty string) instead of one generic regex mismatch, replaces the free-floating `deps(...)` list with explicit `preserve`/`doNot` arrays per step, and lets steps that share a file reuse one `files`-table entry instead of repeating the path on every line.
+
+### The same plan at both ends of the pipeline
+
+`bun run measure --examples` prints the fixture plan twice: the expanded Markdown body a writer model returns, and the blueprint the expensive model emits instead of writing that body. Both counts are measured with the host's native tokenizer (`deepseek-v3`, the fixture plan's own encoding). This is the plan body — 2358 characters, 536 tokens:
+
+```markdown
+# Harden session rotation and report writer-stage token cost
+
+## Context
+
+Refresh tokens currently stay reusable for their whole lifetime, and the writer pipeline reports no per-stage token cost. Rotate the signing key on every refresh, reject a reused nonce, and report the writer payload's real token breakdown so the plan budget becomes measurable.
+
+## Approach
+
+- Modify `src/auth/session-store.ts` lines 42-67 to rotate the signing key on every refresh and reissue the `__Host-scribe_session` cookie under the rotated key; preserve the existing cookie attributes and do not touch the legacy v1 verifier.
+- Modify `src/auth/session-store.ts` lines 88-96 to reject a refresh whose nonce was already consumed and return the `SESSION_ROTATED` error code.
+- Modify `src/plan-mode/model-transition.ts` lines 15-40 to resolve the plan role from `modelRoles.plan` before the writable-mode handoff; preserve the current role precedence and do not change the default writer role.
+- Add a capability probe to `src/plan-mode/model-transition.ts` that reads the catalog once per session and caches the result.
+- Modify `src/writer-session.ts` lines 61-88 to thread the hydrated snippet text into the token accounting so the diagnostic can report snippets apart from the rest of the brief.
+- Add coverage to `tests/auth/session-store-cases.ts` for the rotation path with a fixed clock and a tampered nonce.
+- Modify `tests/auth/session-store-cases.ts` lines 1-12 to extend the revocation case to assert the returned error code; keep the existing fixtures.
+
+## Critical files & anchors
+
+- `src/auth/session-store.ts` — modify — session persistence, rotation, and cookie issuance
+- `src/plan-mode/model-transition.ts` — modify — plan-role resolution and the writable-mode handoff
+- `src/writer-session.ts` — modify — nested writer session spawning and brief assembly
+- `tests/auth/session-store-cases.ts` — modify — existing coverage for rotation and revocation
+
+## Verification
+
+- `bun test tests/auth/session-store-cases.ts` passes with the rotation and revocation cases green
+- `grep` for `SESSION_ROTATED` under `src/auth` returns exactly one call site
+
+## Assumptions & contingencies
+
+- The cookie name stays `__Host-scribe_session` because the host already scopes it to the session subdomain
+- Nonce storage may stay in memory: the session store is process-local
+```
+
+and this is the blueprint — 2140 characters, 518 tokens:
+
+```json
+{"slug":"session-rotation","title":"Harden session rotation and report writer-stage token cost","context":"Refresh tokens stay reusable for their whole lifetime and the writer pipeline reports no per-stage token cost. Rotate the signing key on every refresh, reject a reused nonce, and report the writer payload's real token breakdown so the plan budget is measurable.","literals":[["A1","__Host-scribe_session"],["A2","SESSION_ROTATED"]],"files":[["A","src/auth/session-store.ts","session persistence, rotation, and cookie issuance"],["B","src/plan-mode/model-transition.ts","plan-role resolution and the writable-mode handoff"],["C","src/writer-session.ts","nested writer session spawning and brief assembly"],["D","tests/auth/session-store-cases.ts","existing coverage for rotation and revocation"]],"steps":[["A","~",[42,67],"Rotate the signing key on every refresh and reissue the [[lit:A1]] cookie under the rotated key.",["preserve the existing cookie attributes"],["do not touch the legacy v1 verifier"]],["A","~",[88,96],"Reject a refresh whose nonce was already consumed and return the [[lit:A2]] error code.",[],[]],["B","~",[15,40],"Resolve the plan role from modelRoles.plan before the writable-mode handoff.",["preserve the current role precedence"],["do not change the default writer role"]],["B","+",null,"Add a capability probe that reads the catalog once per session and caches the result.",[],[]],["C","~",[61,88],"Thread the hydrated snippet text into the token accounting so the diagnostic can report snippets apart from the rest of the brief.",[],[]],["D","+",null,"Cover the rotation path with a fixed clock and a tampered nonce.",[],[]],["D","~",[1,12],"Extend the revocation case to assert the returned error code.",["keep the existing fixtures"],[]]],"verification":["bun test tests/auth/session-store-cases.ts passes with the rotation and revocation cases green","grep for [[lit:A2]] under src/auth returns exactly one call site"],"assumptions":["The cookie name stays [[lit:A1]] because the host already scopes it to the session subdomain","Nonce storage may stay in memory: the session store is process-local"]}
+```
+
+The planner's own emission is the smaller of the two — 518 tokens against the 536-token document it stands for — but the structural saving is what happens *after* the first draft: a refinement submits only the fields that changed (one `context` line, one `verification` bullet, one new step), never the section Markdown, and the writer expands just those sections. The plan body is emitted once by the cheap writer model and never re-emitted by the expensive one.
+
+**Literal fidelity** is machine-checked on both plan paths, and the deterministic path runs first. Every `[[lit:<id>]]` marker the planner declared in its `literals` table is substituted character-for-character with the exact declared value in a single pass — no LLM involvement — and the substitution count is reported as the run's resolved literals. The extraction-and-repair gate covers the literals the planner never declared, and re-places a declared `[[lit:<id>]]` marker the writer dropped: `src/literal-fidelity.ts` mines the literals a brief carries — backticked spans, quoted identifiers, `SCREAMING_SNAKE` constants, `local://` references, template fragments, dotted calls, and project-relative paths — and compares them, whitespace-normalized, against the sections the draft returned. A section that lost one is re-emitted by the writer with the missing strings restored verbatim (at most `MAX_FIDELITY_REPAIR_ROUNDS` repair rounds, whose usage and cost fold into the same run), and every section the gate did not flag keeps its exact bytes. A declared literal the repair brief restores is never re-typed by the writer: the brief prints its `[[lit:<id>]]` marker and the extension substitutes the exact value afterwards, so the round only re-places the marker. A literal the repair pass cannot restore — or one that already survives elsewhere in the plan — is reported in `fidelity.missing` instead, so the plan model records the gap rather than re-reading the file. Doc mode runs the same deterministic substitution and gate over its sections. `buildRepairPromptText` gained its `literals` argument, so a repair brief lists the table and prints a missing entry a table entry declares as `[[lit:<id>]] = <value>`. The tool result then ends with the verdict — `Literal fidelity: all <n> load-bearing literals the brief supplies are verified verbatim in the draft`, or the unverified literals in backticks with a pointer at `propose_plan_update` — so the plan model has machine-checked evidence and never has to re-read the plan file to re-verify it. A section the draft never emitted is reported rather than inserted, because the update path's unrendered-heading rejection owns that decision. The extractor is deliberately conservative: a literal it never collects is simply not verified, since a false positive would cost a repair session on every plan.
 
 **Doc-blueprint mode** (opted in with `/scribe-doc`) applies the same blueprint-and-expand flow to any standalone Markdown document — README, ARCHITECTURE, CHANGELOG entries, ADRs, PR descriptions.
 
